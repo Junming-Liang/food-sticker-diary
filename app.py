@@ -168,7 +168,8 @@ def security(response):
     response.headers['Permissions-Policy'] = 'camera=(self), microphone=(), geolocation=()'
     response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     if request.path.startswith('/api/'):
-        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Cache-Control'] = ('private, no-cache, max-age=0, must-revalidate'
+                                             if getattr(g,'private_thumbnail',False) else 'no-store')
         response.headers['X-Robots-Tag'] = 'noindex, nofollow'
     return response
 
@@ -477,19 +478,20 @@ def meal_payload(data):
     return meal_fields(data),cleaned
 
 
-def thumbnail_bytes(image, kind):
+def thumbnail_bytes(image, kind, edge=384, webp=False):
     image = ai.sanitize_sticker(image) if kind == 'sticker' else image.convert('RGB')
-    image.thumbnail((384, 384), Image.Resampling.LANCZOS)
+    image.thumbnail((edge, edge), Image.Resampling.LANCZOS)
     if kind == 'sticker': image = ai.sanitize_sticker(image)
     stream = io.BytesIO()
-    if kind == 'sticker': image.save(stream, format='PNG')
+    if webp: image.save(stream, format='WEBP', lossless=True, exact=True)
+    elif kind == 'sticker': image.save(stream, format='PNG')
     else: image.save(stream, format='JPEG', quality=80, optimize=True)
     return stream.getvalue()
 
 
-def publish_thumbnail(path, content):
+def publish_thumbnail(path, content, suffix='.thumb'):
     """Publish an immutable sidecar atomically while coordinating with deletion."""
-    target = path.with_name(path.name + '.thumb')
+    target = path.with_name(path.name + suffix)
     with _image_lock:
         if not path.is_file(): return None
         if target.is_file(): return target
@@ -536,7 +538,8 @@ def remove_image(user_id, name):
     if name:
         path = UPLOADS / str(user_id) / Path(name).name
         path.unlink(missing_ok=True)
-        path.with_name(path.name + '.thumb').unlink(missing_ok=True)
+        for suffix in ('.thumb','.thumb.webp','.small','.small.webp'):
+            path.with_name(path.name + suffix).unlink(missing_ok=True)
 
 
 def meal_json(row, shared=False):
@@ -658,17 +661,23 @@ def send_meal_image(row, kind):
     if not name: abort(404)
     path = UPLOADS / str(row['user_id']) / Path(name).name
     if not path.is_file(): abort(404)
-    if request.args.get('size') == 'thumbnail':
-        target = path.with_name(path.name + '.thumb')
-        mimetype = 'image/png' if kind in ('sticker','sticker-source') else 'image/jpeg'
+    size=request.args.get('size')
+    if size in ('thumbnail','small'):
+        webp=request.args.get('format')=='webp'
+        suffix=('.small' if size=='small' else '.thumb')+('.webp' if webp else '')
+        target = path.with_name(path.name + suffix)
+        mimetype = 'image/webp' if webp else 'image/png' if kind in ('sticker','sticker-source') else 'image/jpeg'
         try:
             if not target.is_file():
                 with Image.open(path) as image:
-                    content = thumbnail_bytes(image, 'sticker' if kind=='sticker-source' else kind)
-                try: target = publish_thumbnail(path, content)
+                    content = thumbnail_bytes(image, 'sticker' if kind=='sticker-source' else kind,
+                                              edge=160 if size=='small' else 384,webp=webp)
+                try: target = publish_thumbnail(path, content, suffix)
                 except OSError: target = None
                 if target is None: return send_file(io.BytesIO(content), mimetype=mimetype, conditional=False)
-            return send_file(target, mimetype=mimetype, conditional=False)
+            response=send_file(target, mimetype=mimetype, conditional=True)
+            g.private_thumbnail=True
+            return response
         except (OSError, ValueError): abort(404)
     if kind in ('sticker','sticker-source'):
         # Sanitize on output as well, so legacy files remain unchanged on disk.

@@ -14,6 +14,7 @@ const loaded={meals:null,water:null,exercises:null,weekly:null,weights:false,fas
 let loadVersion=0, mutationVersion=0;
 const pictureCache=new Map(),pictureRequests=new Map(),pictureObservers={};
 let pictureBytes=0,pictureGeneration=0;
+const supportsWebp=(()=>{try{return document.createElement('canvas').toDataURL('image/webp').startsWith('data:image/webp')}catch{return false}})();
 
 function clearPictureCache(){
  pictureGeneration++;
@@ -30,7 +31,7 @@ function getPicture(url){
  const cached=pictureFromCache(url);if(cached)return Promise.resolve(cached);
  if(pictureRequests.has(url))return pictureRequests.get(url);
  const generation=pictureGeneration;
- const pending=fetch(url,{credentials:'same-origin',cache:'no-store'}).then(response=>{
+ const pending=fetch(url,{credentials:'same-origin',cache:'no-cache'}).then(response=>{
   if(!response.ok)throw new Error('图片加载失败');return response.blob();
  }).then(blob=>{
   if(generation!==pictureGeneration)return null;
@@ -85,12 +86,12 @@ function sheetTop(title){return `<div class="sheet-top"><h2 id="sheet-title">${e
 function round(n){return Math.round(Number(n)||0)}
 function total(meals,key){return meals.reduce((sum,item)=>sum+Number(item[key]||0),0)}
 function dayTitle(){return state.day===today()?`今天 · ${dateLabel(state.day)}`:dateLabel(state.day)}
-function pic(meal,kind='sticker',token=null){
+function pic(meal,kind='sticker',token=null,size='thumbnail'){
   const wanted=kind==='sticker'&&meal.has_sticker?'sticker':(meal.has_photo?'photo':null);
   if(!wanted)return `<span class="empty-thumb">${icon('image')}</span>`;
   const url=token==='buddy'?`api/buddy/meals/${meal.id}/${wanted}`:token?`api/shared/${encodeURIComponent(token)}/image/${meal.id}/${wanted}`:`api/meals/${meal.id}/${wanted}`;
   const version=wanted==='sticker'?`&v=${meal.sticker_border||0}-${encodeURIComponent(meal.sticker_color||'#ffffff')}`:'';
-  return `<img class="food-thumb" data-picture-src="${url}?size=thumbnail${version}" alt="${esc(meal.name)}" decoding="async">`;
+  return `<img class="food-thumb" data-picture-src="${url}?size=${size}${supportsWebp?'&format=webp':''}${version}" alt="${esc(meal.name)}" decoding="async">`;
 }
 function nav(){return `<nav class="bottom-nav" aria-label="主要导航">
  ${[['today','home','记录'],['analysis','chart','分析'],['buddy','buddy','搭子'],['fasting','timer','断食'],['profile','user','我的']].map(([view,ico,label])=>{const active=state.view===view||(view==='today'&&state.view==='stickers');return `<button class="nav-item ${active?'active':''}" data-action="nav" data-view="${view}" ${active?'aria-current="page"':''}>${icon(ico)}<span>${label}</span></button>`}).join('')}
@@ -112,7 +113,7 @@ function macroGrid(meals=state.meals,goals=state.user){
 function mealGroups(meals=state.meals,token=null){return `<div class="meals">${cats.map(([id,label,ico])=>{
  const items=meals.filter(x=>x.category===id),sum=total(items,'calories');
  return `<section class="meal-group"><div class="meal-group-header"><div class="meal-title"><div class="meal-glyph">${icon(ico==='sun'?'spark':ico)}</div><div><strong>${label}</strong><small>${round(sum)} 千卡</small></div></div>${token?'':`<button class="add-mini" data-action="add" data-category="${id}" aria-label="添加${label}">${icon('plus')}</button>`}</div>
- ${items.length?`<div class="meal-entries">${items.map(m=>`<button class="meal-row" data-action="${token?'view-shared-meal':'edit'}" data-id="${m.id}">${pic(m,'sticker',token)}<span class="food-info"><strong>${esc(m.name)}</strong><small>${m.grams?`${round(m.grams)} 克`:'重量未填写'}</small></span><span class="food-cal">${round(m.calories)} 千卡</span></button>`).join('')}</div>`:`<p class="empty-group">还没有${label}记录</p>`}</section>`}).join('')}</div>`}
+ ${items.length?`<div class="meal-entries">${items.map(m=>`<button class="meal-row" data-action="${token?'view-shared-meal':'edit'}" data-id="${m.id}">${pic(m,'sticker',token,'small')}<span class="food-info"><strong>${esc(m.name)}</strong><small>${m.grams?`${round(m.grams)} 克`:'重量未填写'}</small></span><span class="food-cal">${round(m.calories)} 千卡</span></button>`).join('')}</div>`:`<p class="empty-group">还没有${label}记录</p>`}</section>`}).join('')}</div>`}
 function stickerGrid(meals,token=null){if(!meals.length)return `<div class="no-records">${icon('sticker')}<strong>还没有食物贴纸</strong><p>${token?'这一天还没有饮食记录':'拍下你的下一餐，留下一张食物贴纸'}</p></div>`;
  return `<div class="sticker-grid">${meals.map(m=>`<div class="sticker-card"><button data-action="${token?'view-shared-meal':'edit'}" data-id="${m.id}">${pic(m,'sticker',token)}<strong>${esc(m.name)}</strong><small>${round(m.calories)} 千卡</small>${m.components?.length?`<small>${esc(m.components.map(item=>item.name).join(' · '))}</small>`:''}</button>${!token&&m.has_sticker?`<button class="edit-sticker" data-action="edit-sticker" data-id="${m.id}" aria-label="编辑 ${esc(m.name)} 的贴纸">编辑贴纸</button>`:''}</div>`).join('')}</div>`}
 function exercisePanel(){const burned=total(state.exercises,'calories');return `<div class="section-head" style="margin-top:24px"><h2>运动记录</h2><button class="text-button" data-action="add-exercise">添加运动</button></div><section class="meal-group"><div class="meal-group-header"><div class="meal-title"><div class="meal-glyph">${icon('activity')}</div><div><strong>运动消耗</strong><small>${round(burned)} 千卡</small></div></div><button class="add-mini" data-action="add-exercise" aria-label="添加运动">${icon('plus')}</button></div>${state.exercises.length?`<div class="meal-entries">${state.exercises.map(e=>`<button class="meal-row" data-action="edit-exercise" data-id="${e.id}"><span class="empty-thumb">${icon('activity')}</span><span class="food-info"><strong>${esc(e.name)}</strong><small>${e.minutes} 分钟</small></span><span class="food-cal">${round(e.calories)} 千卡</span></button>`).join('')}</div>`:'<p class="empty-group">还没有运动记录</p>'}</section>`}

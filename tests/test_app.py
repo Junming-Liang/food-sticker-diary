@@ -95,6 +95,19 @@ class DiaryTest(unittest.TestCase):
             self.assertTrue(thumb.is_file())
         response=self.alice.get(f'/api/meals/{mid}/sticker?size=thumbnail')
         self.assertEqual(Image.open(io.BytesIO(response.data)).size,(384,256));response.close()
+        small_url=f'/api/meals/{mid}/sticker?size=small&format=webp'
+        response=self.alice.get(small_url)
+        self.assertEqual(response.mimetype,'image/webp')
+        self.assertIn('private',response.headers['Cache-Control'])
+        self.assertIn('no-cache',response.headers['Cache-Control'])
+        small=Image.open(io.BytesIO(response.data)).convert('RGBA')
+        self.assertEqual(small.size,(160,107));self.assertEqual(small.getpixel((0,0)),(0,0,0,0))
+        self.assertTrue(all(pixel[:3]==(0,0,0) for pixel in small.getdata() if pixel[3]==0))
+        etag=response.headers['ETag'];response.close()
+        cached=self.alice.get(small_url,headers={'If-None-Match':etag})
+        self.assertEqual(cached.status_code,304);cached.close()
+        self.assertEqual(self.bob.get(small_url,headers={'If-None-Match':etag}).status_code,404)
+        self.assertTrue(original.with_name(original.name+'.small.webp').is_file())
         full=self.alice.get(f'/api/meals/{mid}/sticker')
         self.assertEqual(Image.open(io.BytesIO(full.data)).size,(768,512));full.close()
         self.assertEqual(self.bob.get(f'/api/meals/{mid}/sticker?size=thumbnail').status_code,404)
@@ -105,8 +118,16 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(small.size,(384,256)); self.assertEqual(small.getpixel((0,0)),(0,0,0,0));response.close()
         self.assertTrue(thumb.is_file())
         self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/photo?size=thumbnail').status_code,404)
+        share_url=f'/api/shared/{token}/image/{mid}/sticker?size=small&format=webp'
+        response=self.visitor.get(share_url);share_etag=response.headers['ETag'];response.close()
+        cached=self.visitor.get(share_url,headers={'If-None-Match':share_etag})
+        self.assertEqual(cached.status_code,304);cached.close()
+        share_id=self.alice.get('/api/shares').json['shares'][0]['id']
+        self.alice.delete(f'/api/shares/{share_id}')
+        self.assertEqual(self.visitor.get(share_url,headers={'If-None-Match':share_etag}).status_code,404)
         self.alice.delete(f'/api/meals/{mid}')
         self.assertFalse(original.exists());self.assertFalse(thumb.exists())
+        self.assertFalse(original.with_name(original.name+'.small.webp').exists())
 
     def test_sticker_border_editing_preserves_source_and_shares_the_result(self):
         image=Image.new('RGBA',(80,60),(19,51,94,0));image.paste((220,70,20,255),(20,20,60,40))
