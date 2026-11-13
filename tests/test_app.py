@@ -88,6 +88,49 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.delete('/api/account',json={'password':'long-password'}).status_code,200)
         self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['paired'])
 
+    def test_existing_meal_schema_migrates_without_data_loss(self):
+        import sqlite3,subprocess,sys
+        with tempfile.TemporaryDirectory(prefix='food-diary-migration-') as directory:
+            conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
+            conn.execute("""CREATE TABLE meals (id TEXT PRIMARY KEY,user_id INTEGER,day TEXT,category TEXT,name TEXT,
+                         grams REAL,calories REAL,carbs REAL,protein REAL,fat REAL,image TEXT,sticker TEXT,created INTEGER)""")
+            conn.execute("INSERT INTO meals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",('old',1,'2026-11-13','lunch','旧记录',100,123,1,2,3,None,None,1))
+            conn.commit();conn.close()
+            environment=dict(os.environ,FOOD_DATA=directory)
+            result=subprocess.run([sys.executable,'-c',"import app; print(app.DATA)"],env=environment,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
+            self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
+            conn.close()
+
+    def test_meal_components_are_persisted_and_totals_are_authoritative(self):
+        components=[{'name':'米饭','grams':150,'calories':195,'carbs':42.3,'protein':4,'fat':0.4},
+                    {'name':'鸡蛋','grams':100,'calories':155,'carbs':1,'protein':13,'fat':11}]
+        payload={'day':'2026-11-13','category':'lunch','name':'米饭与鸡蛋','calories':9999,'components':components}
+        response=self.alice.post('/api/meals',json=payload)
+        self.assertEqual(response.status_code,201)
+        meal=response.json['meal'];self.assertEqual(meal['calories'],350);self.assertEqual(meal['grams'],250)
+        self.assertEqual([x['name'] for x in meal['components']],['米饭','鸡蛋'])
+        mid=meal['id']
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}',json={'day':'2026-11-13','category':'lunch','name':'旧客户端'}).status_code,409)
+        components[0]['calories']=200
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}',json=payload).json['meal']['calories'],355)
+        self.assertEqual(self.bob.get('/api/meals?day=2026-11-13').json['meals'],[])
+        share=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]['token']
+        self.assertEqual(len(self.visitor.get(f'/api/shared/{share}').json['meals'][0]['components']),2)
+        payload['components']=[{'name':'bad','calories':-1}]
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}',json=payload).status_code,400)
+
+    def test_vision_result_sums_multiple_foods(self):
+        import ai,json
+        content={'name':'米饭和鸡蛋','components':[{'name':'米饭','grams':100,'calories':130,'carbs':28,'protein':3,'fat':0.3},
+                                                  {'name':'鸡蛋','grams':50,'calories':78,'carbs':0.5,'protein':6,'fat':5}]}
+        with patch.object(ai,'provider_response',return_value={'choices':[{'message':{'content':json.dumps(content)}}]}):
+            result=ai.vision_recognize(Image.new('RGB',(20,20)),'openai','test-key','gpt-4o-mini')
+        self.assertEqual(result['calories'],208)
+        self.assertEqual(result['grams'],150)
+        self.assertEqual(len(result['components']),2)
+
     def test_exercise_is_private_and_editable(self):
         payload={'day':'2026-11-13','name':'散步','minutes':30,'calories':120}
         self.assertEqual(self.alice.post('/api/exercises',json=payload).status_code,201)

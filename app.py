@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import secrets
@@ -71,7 +72,8 @@ def initialize():
             id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, category TEXT NOT NULL, name TEXT NOT NULL,
             grams REAL NOT NULL, calories REAL NOT NULL, carbs REAL NOT NULL, protein REAL NOT NULL, fat REAL NOT NULL,
-            image TEXT, sticker TEXT, created INTEGER NOT NULL
+            image TEXT, sticker TEXT, created INTEGER NOT NULL,
+            components TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS meals_user_day ON meals(user_id,day);
         CREATE TABLE IF NOT EXISTS shares (
@@ -111,6 +113,9 @@ def initialize():
             day TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY(user_id, day)
         );
         ''')
+        columns={row['name'] for row in db().execute('PRAGMA table_info(meals)').fetchall()}
+        if 'components' not in columns:
+            db().execute("ALTER TABLE meals ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
         db().commit()
 
 
@@ -347,6 +352,29 @@ def meal_fields(data):
     return [day, category, name, *values]
 
 
+def meal_payload(data):
+    components=data.get('components',[])
+    if not isinstance(components,list) or len(components)>12:
+        raise ValueError('食物明细最多支持 12 项')
+    cleaned=[]
+    for item in components:
+        if not isinstance(item,dict): raise ValueError('请检查食物明细')
+        name=str(item.get('name','')).strip()
+        if not 1 <= len(name) <= 80: raise ValueError('请填写每一项食物名称')
+        entry={'name':name}
+        for key in ('grams','calories','carbs','protein','fat'):
+            try: value=float(item.get(key) or 0)
+            except (TypeError,ValueError): raise ValueError('请检查食物明细的营养数值')
+            if not 0 <= value <= 100000: raise ValueError('食物明细数值超出范围')
+            entry[key]=round(value,1)
+        cleaned.append(entry)
+    if cleaned:
+        data=dict(data)
+        for key in ('grams','calories','carbs','protein','fat'):
+            data[key]=round(sum(item[key] for item in cleaned),1)
+    return meal_fields(data),cleaned
+
+
 def save_image(data_url, user_id, kind):
     if not data_url: return None
     # Leave room for the other services that share this filesystem.
@@ -379,7 +407,8 @@ def remove_image(user_id, name):
 
 def meal_json(row):
     return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created')} | {
-        'has_photo':bool(row['image']), 'has_sticker':bool(row['sticker'])}
+        'has_photo':bool(row['image']), 'has_sticker':bool(row['sticker']),
+        'components':json.loads(row['components'])}
 
 
 @app.get('/api/meals')
@@ -398,15 +427,17 @@ def meals():
 @auth
 def create_meal():
     data = body()
-    try: fields = meal_fields(data)
+    try: fields,components = meal_payload(data)
     except ValueError as exc: return jsonify(error=str(exc)), 400
     photo = sticker = None
     try:
         photo = save_image(data.get('photo'),g.user['id'],'photo')
         sticker = save_image(data.get('sticker'),g.user['id'],'sticker')
         mid = secrets.token_hex(16)
-        db().execute('INSERT INTO meals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                     (mid,g.user['id'],*fields,photo,sticker,int(time.time())))
+        db().execute('''INSERT INTO meals
+            (id,user_id,day,category,name,grams,calories,carbs,protein,fat,image,sticker,created,components)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (mid,g.user['id'],*fields,photo,sticker,int(time.time()),json.dumps(components,ensure_ascii=False)))
         db().commit()
     except Exception as exc:
         remove_image(g.user['id'], photo); remove_image(g.user['id'], sticker)
@@ -421,10 +452,13 @@ def create_meal():
 def update_meal(mid):
     row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
     if not row: abort(404)
-    try: fields = meal_fields(body())
+    data=body()
+    if 'components' not in data and json.loads(row['components']):
+        return jsonify(error='此记录含有食物明细，请刷新页面后再编辑'),409
+    try: fields,components = meal_payload(data)
     except ValueError as exc: return jsonify(error=str(exc)), 400
-    db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?
-                    WHERE id=? AND user_id=?''', (*fields,mid,g.user['id'])); db().commit()
+    db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?,components=?
+                    WHERE id=? AND user_id=?''', (*fields,json.dumps(components,ensure_ascii=False),mid,g.user['id'])); db().commit()
     return jsonify(meal=meal_json(db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()))
 
 

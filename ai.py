@@ -144,26 +144,45 @@ def vision_recognize(image, provider, key, model):
     # Fixed provider URLs avoid exposing the server to user-supplied URL requests.
     endpoints = {'openai': 'https://api.openai.com/v1/chat/completions',
                  'deepseek': 'https://api.deepseek.com/chat/completions'}
-    prompt = ('识别这张食物照片，估算整份餐食的名称、重量和营养。只返回一个 JSON 对象，'
-              '字段为 name（简体中文）、grams（克）、calories（千卡）、carbs、protein、fat（后三者单位均为克）。'
-              '如有多种食物，计算整份合计并在名称中概括。无法判断时合理估计，不要添加 Markdown。')
+    prompt = ('识别照片中的餐食并分项估算。只返回 JSON 对象，name 为整餐简体中文名称，'
+              'components 为数组，每项包含 name（简体中文）、grams（克）、calories（千卡）、'
+              'carbs、protein、fat（后三者单位为克）。按可辨认的食物分项，最多 12 项；'
+              '估算整份实际重量和营养，无法确定时给出合理估计，不要添加 Markdown。')
     data_url = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes(image)).decode()
     body = {'model': model, 'messages': [{'role': 'user', 'content': [
         {'type': 'text', 'text': prompt}, {'type': 'image_url', 'image_url': {'url': data_url}}]}],
-        'response_format': {'type':'json_object'}, 'max_tokens': 500}
+        'response_format': {'type':'json_object'}, 'max_tokens': 1500}
     req = Request(endpoints[provider], data=json.dumps(body, ensure_ascii=False).encode(), method='POST',
                   headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     try:
         text = provider_response(req, provider)['choices'][0]['message']['content']
         parsed = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
-        result = {'name': str(parsed.get('name', ''))[:80]}
+        if not isinstance(parsed,dict): raise ValueError('识别结果格式有误')
+        result = {'name': str(parsed.get('name', '')).strip()[:80]}
         if not result['name']:
             raise ValueError('识别结果缺少食物名称')
-        for field in ('grams','calories','carbs','protein','fat'):
-            value = float(parsed.get(field, 0))
+        fields=('grams','calories','carbs','protein','fat')
+        items=parsed.get('components',parsed.get('items',[]))
+        if not isinstance(items,list) or len(items)>12: raise ValueError('识别的食物明细格式有误')
+        cleaned=[]
+        for item in items:
+            if not isinstance(item,dict): raise ValueError('识别的食物明细格式有误')
+            entry={'name':str(item.get('name','')).strip()[:80]}
+            if not entry['name']: raise ValueError('识别结果缺少食物名称')
+            for field in fields:
+                try: value=float(item.get(field,0))
+                except (ValueError,TypeError): raise ValueError('识别的食物明细格式有误')
+                if not np.isfinite(value) or not 0 <= value <= 100000:
+                    raise ValueError('识别的食物明细格式有误')
+                entry[field]=round(value,1)
+            cleaned.append(entry)
+        for field in fields:
+            try: value=sum(item[field] for item in cleaned) if cleaned else float(parsed.get(field,0))
+            except (ValueError,TypeError): raise ValueError('识别结果格式有误')
             if not np.isfinite(value) or not 0 <= value <= 100000:
                 raise ValueError('识别结果格式有误')
-            result[field] = round(value, 1)
+            result[field]=round(value,1)
+        if cleaned: result['components']=cleaned
         return result
     except HTTPError as exc:
         if exc.code in (401,403): raise ValueError('API 密钥无效或没有权限，请在设置中检查') from exc

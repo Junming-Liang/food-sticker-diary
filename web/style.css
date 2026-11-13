@@ -18,3 +18,5 @@
 .fasting-main{background:#fff2ec;border-radius:14px;padding:20px 16px;text-align:center;margin:8px 0 24px}.fasting-label{font-size:12px;color:#745b52}.fasting-ring{width:220px;height:220px;margin:8px auto 20px}.fasting-ring .ring-base{stroke:#f7ded4}.fasting-ring .ring-value{stroke:#ef5b28}.fasting-main .field{text-align:left}
 
 .food-option{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left;background:#efefeb;border-radius:10px;padding:12px;margin-bottom:6px;color:var(--ink)}.food-option strong,.food-option small{display:block}.food-option strong{font-size:14px}.food-option small{color:#686862;font-size:12px;margin-top:4px}.food-option .icon{width:16px;height:16px;color:#777770}
+
+.component-section{margin:4px 0 14px}.component-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.component-head strong{font-size:14px}.food-component{background:#efefeb;border-radius:12px;padding:12px;margin:8px 0}.food-component .field:last-child{margin-bottom:0}.field input[readonly]{background:#f0f0ec;color:#51514a}
