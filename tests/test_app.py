@@ -1,7 +1,9 @@
 import base64
 import io
+import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -457,6 +459,79 @@ class DiaryTest(unittest.TestCase):
         self.assertFalse(self.alice.get('/api/buddy?day=2026-11-13').json['paired'])
         self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/sticker').status_code,404)
 
+    def test_opt_in_buddy_push_is_encrypted_retried_and_respects_sharing(self):
+        import http_ece,requests,push_worker
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        encode=lambda value:base64.urlsafe_b64encode(value).rstrip(b'=').decode()
+        private=ec.generate_private_key(ec.SECP256R1())
+        public=private.public_key().public_bytes(serialization.Encoding.X962,serialization.PublicFormat.UncompressedPoint)
+        auth=os.urandom(16)
+        subscription={'endpoint':'https://fcm.googleapis.com/fcm/send/'+os.urandom(12).hex(),
+                      'keys':{'p256dh':encode(public),'auth':encode(auth)}}
+        self.assertEqual(self.visitor.get('/api/push/config').status_code,401)
+        key=self.bob.get('/api/push/config').json['public_key']
+        self.assertEqual(self.bob.get('/api/push/config').json['public_key'],key)
+        self.assertEqual(len(base64.urlsafe_b64decode(key+'='*(-len(key)%4))),65)
+        key_file=application.DATA/'vapid-private.pem'
+        self.assertEqual(key_file.stat().st_mode & 0o777,0o600)
+        for endpoint in ('https://127.0.0.1/private','http://fcm.googleapis.com/fcm/send/x',
+                         'https://fcm.googleapis.com.evil.example/fcm/send/x',
+                         'https://name@fcm.googleapis.com/fcm/send/x'):
+            self.assertEqual(self.bob.post('/api/push/subscription',json={'subscription':subscription|{'endpoint':endpoint}}).status_code,400)
+        self.assertEqual(self.bob.post('/api/push/subscription',json={'subscription':subscription}).status_code,200)
+        self.assertTrue(self.bob.post('/api/push/status',json={'endpoint':subscription['endpoint']}).json['enabled'])
+        self.assertFalse(self.alice.post('/api/push/status',json={'endpoint':subscription['endpoint']}).json['enabled'])
+        other_private=ec.generate_private_key(ec.SECP256R1())
+        other_public=other_private.public_key().public_bytes(serialization.Encoding.X962,serialization.PublicFormat.UncompressedPoint)
+        impostor=subscription|{'keys':{'p256dh':encode(other_public),'auth':encode(os.urandom(16))}}
+        self.assertEqual(self.alice.post('/api/push/subscription',json={'subscription':impostor}).status_code,409)
+        token=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':token})
+        meal={'day':'2026-11-13','category':'lunch','name':'不应出现在通知中的菜名','calories':180}
+        mid=self.alice.post('/api/meals',json=meal).json['meal']['id']
+
+        class FakeSession:
+            status=201
+            sent=[]
+            def post(self,url,data=None,headers=None,timeout=None):
+                self.sent.append((url,data,headers))
+                result=requests.Response();result.status_code=self.status;result._content=b''
+                return result
+        fake=FakeSession()
+        self.assertTrue(push_worker.deliver_one(fake))
+        self.assertEqual(len(fake.sent),1)
+        endpoint,encrypted,headers=fake.sent[0]
+        self.assertEqual(endpoint,subscription['endpoint'])
+        self.assertEqual(headers['content-encoding'],'aes128gcm')
+        self.assertEqual(json.loads(http_ece.decrypt(encrypted,private_key=private,auth_secret=auth)),
+                         {'day':'2026-11-13','id':mid})
+        self.assertFalse(push_worker.deliver_one(fake))
+
+        self.alice.post('/api/meals',json=meal)
+        self.alice.put('/api/buddy/sharing',json={'enabled':False})
+        self.assertTrue(push_worker.deliver_one(fake));self.assertEqual(len(fake.sent),1)
+        self.alice.post('/api/meals',json=meal)
+        self.assertFalse(push_worker.deliver_one(fake))
+        self.alice.put('/api/buddy/sharing',json={'enabled':True})
+        self.alice.post('/api/meals',json=meal)
+        fake.status=503;now=int(time.time())
+        self.assertTrue(push_worker.deliver_one(fake,now))
+        with application.app.app_context():
+            row=application.db().execute('SELECT attempts,next_attempt FROM push_outbox').fetchone()
+            self.assertEqual((row['attempts'],row['next_attempt']),(1,now+30))
+        fake.status=410
+        self.assertTrue(push_worker.deliver_one(fake,now+30))
+        self.assertFalse(self.bob.post('/api/push/status',json={'endpoint':subscription['endpoint']}).json['enabled'])
+        self.assertFalse(push_worker.deliver_one(fake,now+30))
+        self.bob.post('/api/push/subscription',json={'subscription':subscription})
+        username=self.bob.get('/api/me').json['user']['username']
+        self.alice.post('/api/auth/logout',json={'push_endpoint':subscription['endpoint']})
+        self.assertTrue(self.bob.post('/api/push/status',json={'endpoint':subscription['endpoint']}).json['enabled'])
+        self.bob.post('/api/auth/logout',json={'push_endpoint':subscription['endpoint']})
+        self.bob.post('/api/auth/login',json={'username':username,'password':'long-password'})
+        self.assertFalse(self.bob.post('/api/push/status',json={'endpoint':subscription['endpoint']}).json['enabled'])
+
     def test_delete_account_revokes_shares_and_data(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
         self.assertEqual(self.alice.post('/api/meals',json=meal).status_code,201)
@@ -476,6 +551,29 @@ class DiaryTest(unittest.TestCase):
             connection.connect()
         self.assertEqual(create.call_args.args[0],('127.0.0.1',18796))
         self.assertEqual(connection._context.wrap_socket.call_args.kwargs['server_hostname'],'api.openai.com')
+
+    def test_fcm_tunnel_keeps_tls_identity_and_limits_destinations(self):
+        import push_worker
+        from unittest.mock import MagicMock
+        connection=push_worker.FcmTunnelConnection(18798,10)
+        connection._context=MagicMock();raw=MagicMock()
+        with patch.object(push_worker.socket,'create_connection',return_value=raw) as create:
+            connection.connect()
+        self.assertEqual(create.call_args.args[0],('127.0.0.1',18798))
+        self.assertEqual(connection._context.wrap_socket.call_args.kwargs['server_hostname'],'fcm.googleapis.com')
+        with patch.dict(os.environ,{'FOOD_FCM_TUNNEL_PORT':'18798'}):
+            session=push_worker.PushSession()
+        incoming=MagicMock(status=201,reason='Created');incoming.getheaders.return_value=[];incoming.read.return_value=b''
+        tunnel=MagicMock();tunnel.getresponse.return_value=incoming
+        with patch.object(push_worker,'FcmTunnelConnection',return_value=tunnel):
+            response=session.post('https://fcm.googleapis.com/fcm/send/token?x=1',data=b'encrypted',headers={'TTL':'60'},timeout=8)
+        self.assertEqual(response.status_code,201)
+        tunnel.request.assert_called_once_with('POST','/fcm/send/token?x=1',body=b'encrypted',headers={'TTL':'60'})
+        with self.assertRaises(ValueError):
+            session.post('https://fcm.googleapis.com.evil.example/fcm/send/token')
+        with patch.object(session.direct,'post',return_value=response) as post:
+            session.post('https://web.push.apple.com/path',data=b'encrypted')
+        self.assertFalse(post.call_args.kwargs['allow_redirects'])
 
     def test_openai_tunnel_sends_only_to_expected_path(self):
         import ai

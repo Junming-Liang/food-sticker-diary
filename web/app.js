@@ -5,11 +5,14 @@ const icon = name => `<svg class="icon" aria-hidden="true"><use href="#i-${name}
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const today = () => localDate(new Date());
 function localDate(d){ return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+function validNoticeDay(value){if(!/^\d{4}-\d{2}-\d{2}$/.test(value||''))return false;const date=new Date(`${value}T12:00:00`);return !Number.isNaN(date.valueOf())&&localDate(date)===value}
 function shiftDay(day, amount){const d=new Date(`${day}T12:00:00`);d.setDate(d.getDate()+amount);return localDate(d)}
 function dateLabel(day){const d=new Date(`${day}T12:00:00`);return `${d.getMonth()+1}月${d.getDate()}日`}
 const cats=[['breakfast','早餐','sun'],['lunch','午餐','spark'],['dinner','晚餐','sticker'],['snack','加餐','plus']];
 const state={user:null,view:'today',day:today(),meals:[],exercises:[],water:0,layout:'list',category:'breakfast',image:null,shares:[],weights:[],weekly:[],fasts:[],foods:[],foodRef:null,nutritionEdited:false,shareToken:new URL(location.href).searchParams.get('share'),shared:null,buddy:null,buddyToken:new URL(location.href).searchParams.get('invite'),scanVersion:0};
 let toastTimer,scanPreviewUrl=null;
+const initialParams=new URL(location.href).searchParams;
+let pendingBuddyDay=initialParams.get('view')==='buddy'?(validNoticeDay(initialParams.get('day'))?initialParams.get('day'):today()):null;
 const loaded={meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null};
 let loadVersion=0, mutationVersion=0;
 const pictureCache=new Map(),pictureRequests=new Map(),pictureObservers={};
@@ -81,6 +84,11 @@ function toast(text){const el=$('#toast');el.textContent=text;el.classList.add('
 function formError(form,message){const el=$(':scope > .form-error',form)||$('.form-error',form);if(el){el.textContent=message;el.classList.add('visible')}else toast(message)}
 function openSheet(content){sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();hydratePictures(sheet)}
 function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();if(scanPreviewUrl){URL.revokeObjectURL(scanPreviewUrl);scanPreviewUrl=null}state.scanVersion++}
+function applyPendingBuddy(){
+ if(!pendingBuddyDay)return;
+ state.view='buddy';state.day=pendingBuddyDay;pendingBuddyDay=null;
+ const url=new URL(location.href);url.searchParams.delete('view');url.searchParams.delete('day');history.replaceState(null,'',url.pathname+url.search+url.hash);
+}
 sheet.addEventListener('cancel',event=>{event.preventDefault();closeSheet()});
 function sheetTop(title){return `<div class="sheet-top"><h2 id="sheet-title">${esc(title)}</h2><button class="icon-button" type="button" data-action="close" aria-label="关闭">${icon('close')}</button></div>`}
 function round(n){return Math.round(Number(n)||0)}
@@ -146,7 +154,7 @@ function buddyView(){
  if(!b?.paired)return `${topBar('我的搭子','和朋友一起记录',back)}<section class="share-banner"><h2>一起记录，互相陪伴</h2><p>发送邀请并由对方确认后，你们可以互看每日热量与食物贴纸。双方可分别暂停共享或解除绑定。</p><button class="button" data-action="invite-buddy">${icon('share')}邀请搭子</button></section><div class="no-records">${icon('user')}<strong>还没有绑定搭子</strong><p>邀请链接 24 小时内有效，每个人同时只能绑定一位搭子</p></div>`;
  return `${topBar('我的搭子',dateLabel(state.day),back)}${dateStrip()}<section class="buddy-identity"><div class="avatar">${esc(b.username.slice(0,1).toUpperCase())}</div><div class="buddy-identity-text"><strong>${esc(b.username)}</strong><small>${b.sharing?'你正在向对方共享':'你已暂停向对方共享'}</small></div><button class="text-button" data-action="buddy-settings">共享设置</button></section>${b.other_sharing?`${ring(b.meals,[],b.target,true)}${macroGrid(b.meals,{})}<div class="section-head"><h2>饮食记录</h2><span class="section-sub">对方的记录 · 只读</span></div>${mealGroups(b.meals,'buddy')}`:`<div class="no-records">${icon('lock')}<strong>对方已暂停共享</strong><p>恢复共享后可以继续查看</p></div>`}`;
 }
-function profileView(){const username=esc(state.user.username);return `${topBar('我的')}<div class="account"><div class="avatar">${esc(state.user.username.slice(0,1).toUpperCase())}</div><div><strong>${username}</strong><small>记录每一餐，照顾好自己</small></div></div><section class="panel"><div class="panel-top"><div><h2>今天喝水了吗</h2><p class="panel-note">每次增减 250 毫升</p></div>${icon('drop')}</div><div class="water-line"><div class="water-count"><strong>${state.water}</strong> <span>毫升</span></div><div class="stepper"><button data-action="water" data-amount="-250" aria-label="减少饮水">−</button><button data-action="water" data-amount="250" aria-label="增加饮水">+</button></div></div></section><div class="setting-list"><button class="setting-row" data-action="settings">${icon('spark')}<span>热量目标与识别设置<small>每日 ${state.user.target} 千卡 · ${state.user.provider==='local'?'本地识别':esc(state.user.provider)}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="weight">${icon('weight')}<span>体重记录<small>${state.weights.length?`${state.weights[0].weight} 千克 · ${state.weights[0].day}`:'记录今天的体重'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="buddy">${icon('user')}<span>我的搭子<small>互看每日热量和食物贴纸</small></span>${icon('chevron')}</button><button class="setting-row" data-action="manage-shares">${icon('share')}<span>分享管理<small>查看或撤销分享链接</small></span>${icon('chevron')}</button></div><button class="button outline full" data-action="logout">退出登录</button><button class="text-button danger" data-action="delete-account" style="display:block;margin:10px auto 0">删除账号及数据</button><p class="privacy-copy">你的饮食数据默认仅自己可见，只有主动创建分享链接后其他人才能查看对应日期。识别结果仅供日常参考。</p>`}
+function profileView(){const username=esc(state.user.username);return `${topBar('我的')}<div class="account"><div class="avatar">${esc(state.user.username.slice(0,1).toUpperCase())}</div><div><strong>${username}</strong><small>记录每一餐，照顾好自己</small></div></div><section class="panel"><div class="panel-top"><div><h2>今天喝水了吗</h2><p class="panel-note">每次增减 250 毫升</p></div>${icon('drop')}</div><div class="water-line"><div class="water-count"><strong>${state.water}</strong> <span>毫升</span></div><div class="stepper"><button data-action="water" data-amount="-250" aria-label="减少饮水">−</button><button data-action="water" data-amount="250" aria-label="增加饮水">+</button></div></div></section><div class="setting-list"><button class="setting-row" data-action="settings">${icon('spark')}<span>热量目标与识别设置<small>每日 ${state.user.target} 千卡 · ${state.user.provider==='local'?'本地识别':esc(state.user.provider)}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="weight">${icon('weight')}<span>体重记录<small>${state.weights.length?`${state.weights[0].weight} 千克 · ${state.weights[0].day}`:'记录今天的体重'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="buddy">${icon('user')}<span>我的搭子<small>互看每日热量和食物贴纸</small></span>${icon('chevron')}</button><button class="setting-row" data-action="push-settings">${icon('bell')}<span>搭子更新提醒<small>搭子记录新餐食时通知本机</small></span>${icon('chevron')}</button><button class="setting-row" data-action="manage-shares">${icon('share')}<span>分享管理<small>查看或撤销分享链接</small></span>${icon('chevron')}</button></div><button class="button outline full" data-action="logout">退出登录</button><button class="text-button danger" data-action="delete-account" style="display:block;margin:10px auto 0">删除账号及数据</button><p class="privacy-copy">你的饮食数据默认仅自己可见，只有主动创建分享链接后其他人才能查看对应日期。识别结果仅供日常参考。</p>`}
 function render(){
  if(state.shareToken){renderShared();hydratePictures(app);return}
  if(!state.user){renderAuth();return}
@@ -286,8 +294,67 @@ function exerciseForm(item=null){const editing=Boolean(item);openSheet(`${sheetT
 function settingsSheet(){const u=state.user;openSheet(`${sheetTop('目标与识别设置')}<form id="settings-form"><label class="field"><span>每日热量目标 · 千卡</span><input type="number" name="target" value="${u.target}" min="500" max="10000" required><small>默认目标仅为初始值，请根据自己的情况调整。</small></label><div class="form-grid three">${[['carbs_goal','碳水 · 克'],['protein_goal','蛋白质 · 克'],['fat_goal','脂肪 · 克']].map(([field,label])=>`<label class="field"><span>${label}</span><input type="number" name="${field}" min="0.1" max="2000" step="0.1" placeholder="不设置" value="${esc(u[field]??'')}"></label>`).join('')}</div><p class="panel-note">营养目标可按个人需要填写，留空表示不设置。</p><label class="field"><span>照片识别服务</span><select name="provider"><option value="local" ${u.provider==='local'?'selected':''}>本地识别</option><option value="deepseek" ${u.provider==='deepseek'?'selected':''}>DeepSeek</option><option value="openai" ${u.provider==='openai'?'selected':''}>OpenAI</option></select></label><div id="provider-fields" ${u.provider==='local'?'hidden':''}><label class="field"><span>模型名称</span><input name="model" value="${esc(u.model)}" placeholder="输入支持图片的模型名称"><small>DeepSeek 推荐 deepseek-flash，deepseek-v4-pro 暂不支持图片；OpenAI 默认 gpt-4o-mini。</small></label><label class="field"><span>API 密钥</span><input name="api_key" type="password" autocomplete="off" placeholder="${u.has_key?'已配置；留空保持不变':'输入你的 API 密钥'}"><small>两家服务的密钥分开加密保存，留空可保留已保存的密钥。识别照片会发送至所选服务商，并可能产生费用。</small></label><label><input type="checkbox" name="clear_key"> <span class="panel-note">清除当前保存的密钥</span></label>${u.provider==='openai'&&u.has_key?'<p><button class="text-button" type="button" data-action="check-openai">检测已保存的 OpenAI 配置</button></p>':''}</div><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button" type="submit">保存设置</button></div></form>`)}
 function shareSheet(){const links=state.shares.map(s=>`<div class="share-item"><div>${esc(s.day)}<small>有效至 ${new Date(s.expires*1000).toLocaleDateString('zh-CN')}</small></div><button class="text-button" data-action="copy-share" data-token="${esc(s.token)}">复制</button><button class="text-button danger" data-action="revoke" data-id="${s.id}">撤销</button></div>`).join('');
  openSheet(`${sheetTop('分享管理')}<p class="sheet-description">链接可查看对应日期的餐食和贴纸，原照片不会分享。自动抠图可能保留部分背景，请先查看贴纸。链接 7 天后自动失效，也可随时撤销。</p><button class="button full" data-action="create-share">${icon('share')}生成 ${dateLabel(state.day)} 的分享链接</button><div style="margin-top:16px">${links||'<p class="panel-note">还没有有效的分享链接。</p>'}</div>`)}
-function buddySettingsSheet(){const buddy=state.buddy;if(!buddy?.paired)return;openSheet(`${sheetTop('共享设置')}<p class="sheet-description">${buddy.sharing?'对方可以查看你的热量和食物贴纸。':'你已暂停向对方共享。'}原照片不会分享，双方都可以随时暂停或解除绑定。</p><button class="button secondary full" data-action="toggle-buddy" data-enabled="${!buddy.sharing}">${buddy.sharing?'暂停我的共享':'恢复我的共享'}</button><button class="text-button danger buddy-unbind" data-action="confirm-unbind">解除绑定</button>`)}
+function buddySettingsSheet(){const buddy=state.buddy;if(!buddy?.paired)return;openSheet(`${sheetTop('共享设置')}<p class="sheet-description">${buddy.sharing?'对方可以查看你的热量和食物贴纸。':'你已暂停向对方共享。'}原照片不会分享，双方都可以随时暂停或解除绑定。</p><button class="button secondary full" data-action="toggle-buddy" data-enabled="${!buddy.sharing}">${buddy.sharing?'暂停我的共享':'恢复我的共享'}</button><button class="button outline full push-settings-entry" data-action="push-settings">搭子更新提醒</button><button class="text-button danger buddy-unbind" data-action="confirm-unbind">解除绑定</button>`)}
 function weightSheet(){openSheet(`${sheetTop('体重记录')}<form id="weight-form"><div class="form-grid"><label class="field"><span>日期</span><input type="date" name="day" value="${state.day}" required></label><label class="field"><span>体重 · 千克</span><input type="number" name="weight" min="10" max="500" step="0.1" required placeholder="例如 60.5"></label></div><p class="form-error" role="alert"></p><button class="button full" type="submit">保存体重</button></form><div style="margin-top:16px">${state.weights.map(w=>`<div class="share-item"><div>${esc(w.day)}<small>${w.weight} 千克</small></div><button class="text-button danger" data-action="confirm-delete-weight" data-day="${esc(w.day)}">删除</button></div>`).join('')||'<p class="panel-note">还没有体重记录。</p>'}</div>`)}
+function pushSupported(){return window.isSecureContext&&'serviceWorker' in navigator&&'PushManager' in window&&'Notification' in window}
+async function pushRegistration(){
+ let timer;try{return await Promise.race([navigator.serviceWorker.ready,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('通知服务尚未就绪，请稍后重试')),10000)})])}finally{clearTimeout(timer)}
+}
+async function currentPushSubscription(){
+ if(!pushSupported())return null;
+ const registration=await navigator.serviceWorker.getRegistration();
+ return registration?registration.pushManager.getSubscription():null;
+}
+async function pushStatus(endpoint){
+ const response=await fetch('api/push/status',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint})});
+ if(!response.ok)throw new Error('无法检查本机提醒状态，请稍后重试');
+ return (await response.json()).enabled;
+}
+function pushSettingsSheet(){
+ openSheet(`${sheetTop('搭子更新提醒')}<section id="push-settings"><p class="sheet-description">搭子共享并记录新餐食时，本机会收到提醒。通知不包含食物照片或营养数据。</p><div id="push-state" aria-live="polite"><p class="panel-note">正在检查本机通知设置…</p></div><p class="form-error" id="push-error" role="alert"></p></section>`);
+ refreshPushSettings($('#push-settings',sheet));
+}
+function pushError(panel,message){const error=$('#push-error',panel);if(error){error.textContent=message;error.classList.add('visible')}}
+async function refreshPushSettings(panel){
+ const target=$('#push-state',panel);if(!target)return;
+ if(!pushSupported()){
+  target.innerHTML='<p class="panel-note">当前浏览器暂不支持通知。iPhone 或 iPad 请先在 Safari 中选择“分享 → 添加到主屏幕”，再从主屏幕打开并开启提醒。</p>';return;
+ }
+ try{
+  const registration=await pushRegistration(),subscription=await registration.pushManager.getSubscription();
+  const enabled=subscription?await pushStatus(subscription.endpoint):false;
+  if(!panel.isConnected)return;
+  const denied=Notification.permission==='denied';
+  target.innerHTML=`<p class="panel-note">${enabled?'本机已开启提醒。':'本机尚未开启提醒。'}${denied?'系统或浏览器已关闭通知权限，请在设置中允许。':''}</p>${enabled?'<button class="button secondary full push-settings-entry" type="button" data-action="push-disable">关闭本机提醒</button>':denied?'':'<button class="button full push-settings-entry" type="button" data-action="push-enable">开启本机提醒</button>'}`;
+ }catch(error){if(panel.isConnected)pushError(panel,error.message)}
+}
+function pushKey(value){const raw=atob(value.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-value.length%4)%4));return Uint8Array.from(raw,c=>c.charCodeAt(0))}
+async function enablePush(button){
+ const panel=button.closest('#push-settings');button.disabled=true;$('#push-error',panel).classList.remove('visible');
+ try{
+  const permission=Notification.permission==='granted'?'granted':await Notification.requestPermission();
+  if(permission!=='granted')throw new Error('未获得通知权限，请在手机或浏览器设置中允许');
+  const config=await api('push/config'),registration=await pushRegistration(),key=pushKey(config.public_key);
+  const previous=await registration.pushManager.getSubscription();let subscription=previous;
+  if(previous){const old=previous.options?.applicationServerKey?new Uint8Array(previous.options.applicationServerKey):null;
+   if(!old||old.length!==key.length||old.some((value,index)=>value!==key[index])){await previous.unsubscribe();subscription=null}}
+  const created=!subscription;
+  if(!subscription)subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:key});
+  try{await api('push/subscription',{method:'POST',body:{subscription:subscription.toJSON(),previous_endpoint:previous?.endpoint}})}
+  catch(error){if(created)await subscription.unsubscribe().catch(()=>{});throw error}
+  if(panel.isConnected){await refreshPushSettings(panel);toast('本机提醒已开启')}
+ }catch(error){if(panel.isConnected)pushError(panel,/^[\x00-\x7f]*$/.test(error.message||'')?'无法开启提醒，请检查手机通知权限和网络后重试':error.message)}
+ finally{button.disabled=false}
+}
+async function disablePush(button){
+ const panel=button.closest('#push-settings');button.disabled=true;$('#push-error',panel).classList.remove('visible');
+ try{
+  const subscription=await currentPushSubscription();
+  if(subscription){await api('push/subscription',{method:'DELETE',body:{endpoint:subscription.endpoint}});await subscription.unsubscribe()}
+  if(panel.isConnected){await refreshPushSettings(panel);toast('本机提醒已关闭')}
+ }catch(error){if(panel.isConnected)pushError(panel,error.message||'无法关闭提醒，请稍后重试')}
+ finally{button.disabled=false}
+}
 async function preparePhoto(file){
  if(!file)return;const version=++state.scanVersion;
  if(scanPreviewUrl)URL.revokeObjectURL(scanPreviewUrl);
@@ -372,6 +439,9 @@ document.addEventListener('click',async event=>{
   if(action==='delete-fast'){await api(`fasts/${button.dataset.id}`,{method:'DELETE'});closeSheet();await loadView();toast('记录已删除');return}
   if(action==='buddy'){state.view='buddy';await loadView({instant:true});return}
   if(action==='buddy-settings'){buddySettingsSheet();return}
+  if(action==='push-settings'){pushSettingsSheet();return}
+  if(action==='push-enable'){await enablePush(button);return}
+  if(action==='push-disable'){await disablePush(button);return}
   if(action==='invite-buddy'){const result=await api('buddy/invites',{method:'POST',body:{}});await copyBuddyInvite(result.token);return}
   if(action==='dismiss-invite'){state.buddyToken=null;history.replaceState(null,'',location.pathname);closeSheet();return}
   if(action==='accept-buddy'){await api('buddy/accept',{method:'POST',body:{token:state.buddyToken}});state.buddyToken=null;history.replaceState(null,'',location.pathname);closeSheet();state.view='buddy';await loadView();toast('已绑定搭子');return}
@@ -389,7 +459,7 @@ document.addEventListener('click',async event=>{
   if(action==='copy-share'){await copyShare(button.dataset.token);return}
   if(action==='revoke'){await api(`shares/${button.dataset.id}`,{method:'DELETE'});state.shares=(await api('shares')).shares;shareSheet();toast('分享链接已撤销');return}
   if(action==='delete-account'){openSheet(`${sheetTop('删除账号及数据')}<p class="sheet-description">此操作会从应用中删除账号、饮食照片、贴纸、运动、体重、断食和全部分享链接，无法撤销。服务器已有备份不会自动删除，请由管理员单独处理。</p><form id="delete-account-form"><label class="field"><span>输入密码以确认</span><input type="password" name="password" autocomplete="current-password" required></label><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button secondary" type="button" data-action="close">取消</button><button class="button" type="submit">永久删除</button></div></form>`);return}
-  if(action==='logout'){await api('auth/logout',{method:'POST',body:{}});state.user=null;state.meals=[];render();return}
+  if(action==='logout'){const subscription=await currentPushSubscription().catch(()=>null);const result=await api('auth/logout',{method:'POST',body:{push_endpoint:subscription?.endpoint}});if(subscription&&result.push_removed)await subscription.unsubscribe().catch(()=>{});state.user=null;state.meals=[];render();return}
  }catch(e){button.disabled=false;toast(e.message)}
 });
 
@@ -397,9 +467,9 @@ document.addEventListener('submit',async event=>{
  event.preventDefault();const form=event.target;const values=Object.fromEntries(new FormData(form).entries());const submit=$('[type="submit"]',form);if(submit)submit.disabled=true;
  try{
   if(form.id==='auth-form'){
-    const result=await api(`auth/${form.dataset.mode}`,{method:'POST',body:values});state.user=result.user;state.view='today';state.day=today();await loadView();await showBuddyInvite();return;
+    const result=await api(`auth/${form.dataset.mode}`,{method:'POST',body:values});state.user=result.user;state.view='today';state.day=today();applyPendingBuddy();await loadView();await showBuddyInvite();return;
   }
-  if(form.id==='delete-account-form'){await api('account',{method:'DELETE',body:values});state.user=null;state.meals=[];state.shares=[];closeSheet();render();toast('账号及数据已删除');return}
+  if(form.id==='delete-account-form'){const subscription=await currentPushSubscription().catch(()=>null);const result=await api('account',{method:'DELETE',body:{...values,push_endpoint:subscription?.endpoint}});if(subscription&&result.push_removed)await subscription.unsubscribe().catch(()=>{});state.user=null;state.meals=[];state.shares=[];closeSheet();render();toast('账号及数据已删除');return}
   if(form.id==='date-form'){state.day=values.day;closeSheet();await loadView({instant:true});return}
   if(form.id==='meal-form'){
     const id=form.dataset.id;const payload={...values};payload.components=[...form.querySelectorAll('.food-component')].map(item=>Object.fromEntries([...item.querySelectorAll('[data-component-field]')].map(input=>[input.dataset.componentField,input.value])));if(!id&&state.image){payload.photo=state.image.photo;payload.sticker=state.image.sticker}
@@ -451,8 +521,15 @@ async function boot(){
  if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
  try{
   if(state.shareToken){try{state.shared=await api(`shared/${encodeURIComponent(state.shareToken)}`)}catch{state.shared=null}render();return}
-  state.user=(await api('me')).user;if(state.user){await loadView();await showBuddyInvite()}else render();
+  state.user=(await api('me')).user;if(state.user){applyPendingBuddy();await loadView();await showBuddyInvite()}else render();
  }catch(e){app.innerHTML=`<main id="main" class="screen no-nav">${topBar('轻食日记')}<div class="no-records">${icon('lock')}<strong>暂时无法连接服务</strong><p>${esc(e.message)}</p></div><p><button class="button full" data-action="reload">重新加载</button></p></main>`;}
 }
 document.addEventListener('click',event=>{if(event.target.closest('[data-action="reload"]'))location.reload()});
+if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',event=>{
+ if(event.data?.type!=='buddy-notification')return;
+ const day=validNoticeDay(event.data.day)?event.data.day:today();
+ if(!state.user){pendingBuddyDay=day;return}
+ if(sheet.open){toast('搭子有新记录，完成当前操作后可在搭子页查看');return}
+ pendingBuddyDay=day;applyPendingBuddy();loadView({instant:true}).catch(error=>toast(error.message));
+});
 boot();

@@ -2,7 +2,9 @@
   "name": "food-sticker-diary-tests",
   "private": true,
   "scripts": {
-    "test:ui": "node tests/browser-smoke.cjs"
+    "test:ui": "node tests/browser-smoke.cjs",
+    "test:sw": "node tests/sw-notifications.cjs",
+    "test:push": "node tests/browser-push.cjs"
   },
   "devDependencies": {
     "playwright-core": "1.65.0"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Food diary buddy notification delivery
+After=network-online.target food-sticker-diary.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fooddiary
+Group=fooddiary
+WorkingDirectory=/srv/food-sticker-diary
+Environment=FOOD_DATA=/var/lib/food-sticker-diary
+EnvironmentFile=-/etc/food-sticker-diary/push.env
+ExecStart=/srv/food-sticker-diary/.venv/bin/python /srv/food-sticker-diary/push_worker.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/food-sticker-diary
+MemoryMax=256M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

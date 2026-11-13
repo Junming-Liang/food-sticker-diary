@@ -1,0 +1,14 @@
+# Optional: tunnel only Android's FCM endpoint through a connected desktop.
+[Unit]
+Description=Food diary Android push TLS bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -R 127.0.0.1:18798:fcm.googleapis.com:443 tecent_blog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

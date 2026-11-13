@@ -4,3 +4,4 @@ numpy==2.5.4
 onnxruntime==1.31.1
 cryptography==46.0.7
 waitress==3.0.2
+pywebpush==2.3.0

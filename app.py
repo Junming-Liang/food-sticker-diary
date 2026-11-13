@@ -21,6 +21,7 @@ from flask import Flask, abort, g, jsonify, request, send_file, send_from_direct
 from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 import ai
+import notifications
 
 # minimal: one lock protects image creation/deletion and thumbnail publication.
 _image_lock = threading.RLock()
@@ -112,6 +113,17 @@ def initialize():
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             expires INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            endpoint TEXT NOT NULL UNIQUE, subscription TEXT NOT NULL, created INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS push_outbox (
+            id INTEGER PRIMARY KEY, subscription_id INTEGER NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+            meal_id TEXT NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
+            created INTEGER NOT NULL, next_attempt INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(subscription_id,meal_id)
+        );
+        CREATE INDEX IF NOT EXISTS push_outbox_due ON push_outbox(next_attempt,id);
         CREATE TABLE IF NOT EXISTS water (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY(user_id, day)
@@ -262,8 +274,13 @@ def login():
 @auth
 def logout():
     token = request.cookies.get('food_session', '')
+    endpoint=body().get('push_endpoint')
+    push_removed=False
+    if isinstance(endpoint,str) and len(endpoint)<=2048:
+        push_removed=db().execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',
+                                  (g.user['id'],endpoint)).rowcount>0
     db().execute('DELETE FROM sessions WHERE token_hash=?', (digest(token),)); db().commit()
-    response = jsonify(ok=True); response.delete_cookie('food_session', path=BASE)
+    response = jsonify(ok=True,push_removed=push_removed); response.delete_cookie('food_session', path=BASE)
     return response
 
 
@@ -272,21 +289,76 @@ def me():
     return jsonify(user=public_user(g.user) if g.user else None)
 
 
+@app.get('/api/push/config')
+@auth
+def push_config():
+    return jsonify(public_key=notifications.vapid_public_key(DATA))
+
+
+@app.post('/api/push/status')
+@auth
+def push_status():
+    endpoint=body().get('endpoint')
+    enabled=isinstance(endpoint,str) and len(endpoint)<=2048 and bool(db().execute(
+        'SELECT 1 FROM push_subscriptions WHERE user_id=? AND endpoint=?',(g.user['id'],endpoint)).fetchone())
+    return jsonify(enabled=enabled)
+
+
+@app.post('/api/push/subscription')
+@auth
+def subscribe_push():
+    data=body()
+    try: subscription=notifications.validate_subscription(data.get('subscription'))
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    endpoint=subscription['endpoint']
+    db().execute('BEGIN IMMEDIATE')
+    existing=db().execute('SELECT * FROM push_subscriptions WHERE endpoint=?',(endpoint,)).fetchone()
+    if existing and existing['user_id']!=g.user['id']:
+        previous=json.loads(existing['subscription'])
+        if previous['keys']!=subscription['keys']:
+            return jsonify(error='该设备的通知订阅不可用，请重新开启'),409
+        db().execute('DELETE FROM push_subscriptions WHERE id=?',(existing['id'],))
+        existing=None
+    count=db().execute('SELECT count(*) FROM push_subscriptions WHERE user_id=?',(g.user['id'],)).fetchone()[0]
+    if not existing and count>=10: return jsonify(error='通知设备已达上限，请先关闭其他设备的提醒'),400
+    db().execute('''INSERT INTO push_subscriptions(user_id,endpoint,subscription,created) VALUES(?,?,?,?)
+                 ON CONFLICT(endpoint) DO UPDATE SET subscription=excluded.subscription,created=excluded.created''',
+                 (g.user['id'],endpoint,json.dumps(subscription,separators=(',',':')),int(time.time())))
+    previous_endpoint=data.get('previous_endpoint')
+    if isinstance(previous_endpoint,str) and previous_endpoint!=endpoint and len(previous_endpoint)<=2048:
+        db().execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',(g.user['id'],previous_endpoint))
+    db().commit()
+    return jsonify(enabled=True)
+
+
+@app.delete('/api/push/subscription')
+@auth
+def unsubscribe_push():
+    endpoint=body().get('endpoint')
+    if not isinstance(endpoint,str) or not endpoint or len(endpoint)>2048:
+        return jsonify(error='通知订阅格式不正确'),400
+    db().execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',(g.user['id'],endpoint));db().commit()
+    return jsonify(enabled=False)
+
+
 @app.delete('/api/account')
 @auth
 @serialized_images
 def delete_account():
     if auth_rate_limited(): return jsonify(error='操作太频繁，请稍后再试'), 429
-    password = str(body().get('password', ''))
+    data=body();password = str(data.get('password', ''))
     if len(password) > 128 or not check_password_hash(g.user['password'], password):
         return jsonify(error='密码不正确'), 401
     user_id = g.user['id']
+    endpoint=data.get('push_endpoint')
+    push_removed=isinstance(endpoint,str) and len(endpoint)<=2048 and bool(db().execute(
+        'SELECT 1 FROM push_subscriptions WHERE user_id=? AND endpoint=?',(user_id,endpoint)).fetchone())
     # Remove the image files before deleting the account so an I/O error remains retryable.
     folder = UPLOADS / str(user_id)
     if folder.is_dir(): shutil.rmtree(folder)
     db().execute('DELETE FROM buddy_pairs WHERE id IN (SELECT pair_id FROM buddy_members WHERE user_id=?)', (user_id,))
     db().execute('DELETE FROM users WHERE id=?', (user_id,)); db().commit()
-    response = jsonify(ok=True); response.delete_cookie('food_session', path=BASE)
+    response = jsonify(ok=True,push_removed=push_removed); response.delete_cookie('food_session', path=BASE)
     return response
 
 
@@ -577,6 +649,12 @@ def create_meal():
             (id,user_id,day,category,name,grams,calories,carbs,protein,fat,image,sticker,created,components)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (mid,g.user['id'],*fields,photo,sticker,int(time.time()),json.dumps(components,ensure_ascii=False)))
+        now=int(time.time())
+        db().execute('''INSERT INTO push_outbox(subscription_id,meal_id,created,next_attempt)
+            SELECT s.id,?,?,? FROM buddy_members mine
+            JOIN buddy_members peer ON peer.pair_id=mine.pair_id AND peer.user_id<>mine.user_id
+            JOIN push_subscriptions s ON s.user_id=peer.user_id
+            WHERE mine.user_id=? AND mine.sharing=1''',(mid,now,now,g.user['id']))
         db().commit()
     except Exception as exc:
         remove_image(g.user['id'], photo); remove_image(g.user['id'], sticker)

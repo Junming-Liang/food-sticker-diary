@@ -25,6 +25,7 @@
 
 .record-actions{display:flex;align-items:center;gap:4px}
 .buddy-identity{display:flex;align-items:center;gap:12px;margin:-2px 0 18px;padding:12px 14px;background:#fff;border-radius:14px}.buddy-identity-text{flex:1;min-width:0}.buddy-identity-text strong,.buddy-identity-text small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.buddy-identity-text strong{font-size:14px}.buddy-identity-text small{margin-top:4px;color:#686862;font-size:12px}.buddy-unbind{display:block;margin:10px auto 0}
+.push-settings-entry{margin-top:12px}
 .meals,.meal-entries{grid-template-columns:minmax(0,1fr)}.sheet-top h2{min-width:0;overflow-wrap:anywhere}
 .recognition-correction{margin:0 0 16px;padding:12px;border:1px solid #deded8;border-radius:12px;background:#fff}
 .recognition-correction summary{cursor:pointer;font-size:13px;line-height:20px;font-weight:650;color:#b9341d}
