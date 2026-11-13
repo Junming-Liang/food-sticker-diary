@@ -1,9 +1,12 @@
 """Photo processing and optional vision providers; models stay outside the repository."""
 import base64
 import io
+import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import threading
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -101,6 +104,42 @@ def local_recognize(image):
                  'confidence': round(float(probs[i]), 3)} for i in np.argsort(probs)[-3:][::-1]]
 
 
+class OpenAITunnelConnection(http.client.HTTPSConnection):
+    """Connect only to a local SSH forward while verifying OpenAI's actual TLS identity."""
+    def __init__(self, tunnel_port, timeout=75):
+        super().__init__('api.openai.com', timeout=timeout, context=ssl.create_default_context())
+        self.tunnel_port = tunnel_port
+
+    def connect(self):
+        sock = socket.create_connection(('127.0.0.1', self.tunnel_port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname='api.openai.com')
+        except Exception:
+            sock.close()
+            raise
+
+
+def provider_response(req, provider):
+    port_value = os.environ.get('FOOD_OPENAI_TUNNEL_PORT', '') if provider == 'openai' else ''
+    if port_value:
+        try:
+            port = int(port_value)
+            if not 1 <= port <= 65535: raise ValueError()
+        except ValueError as exc:
+            raise ValueError('OpenAI 桥接端口配置不正确') from exc
+        conn = OpenAITunnelConnection(port)
+        try:
+            conn.request('POST', '/v1/chat/completions', body=req.data, headers=dict(req.header_items()))
+            response = conn.getresponse()
+            if response.status >= 400:
+                raise HTTPError(req.full_url, response.status, 'API request failed', response.headers, None)
+            return json.loads(response.read(2 * 1024 * 1024))
+        finally:
+            conn.close()
+    with urlopen(req, timeout=75) as response:
+        return json.load(response)
+
+
 def vision_recognize(image, provider, key, model):
     # Fixed provider URLs avoid exposing the server to user-supplied URL requests.
     endpoints = {'openai': 'https://api.openai.com/v1/chat/completions',
@@ -115,10 +154,7 @@ def vision_recognize(image, provider, key, model):
     req = Request(endpoints[provider], data=json.dumps(body, ensure_ascii=False).encode(), method='POST',
                   headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     try:
-        with urlopen(req, timeout=75) as response:
-            if response.status != 200:
-                raise ValueError('识别服务暂不可用')
-            text = json.load(response)['choices'][0]['message']['content']
+        text = provider_response(req, provider)['choices'][0]['message']['content']
         parsed = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
         result = {'name': str(parsed.get('name', ''))[:80]}
         if not result['name']:
@@ -133,7 +169,9 @@ def vision_recognize(image, provider, key, model):
         if exc.code in (401,403): raise ValueError('API 密钥无效或没有权限，请在设置中检查') from exc
         if exc.code == 429: raise ValueError('识别服务额度不足或请求过多，请稍后再试') from exc
         raise ValueError(f'识别服务返回错误（{exc.code}），请检查模型名称与服务状态') from exc
-    except (URLError, TimeoutError) as exc:
+    except (URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        if provider == 'openai' and os.environ.get('FOOD_OPENAI_TUNNEL_PORT'):
+            raise ValueError('OpenAI 桥接暂不可用，请检查台式机是否开机联网') from exc
         raise ValueError('无法连接识别服务，请检查网络后重试') from exc
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError('识别结果无法读取，请重试或手动填写') from exc

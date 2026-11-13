@@ -12,6 +12,7 @@ Environment=FOOD_DATA=/var/lib/food-sticker-diary
 Environment=FOOD_MODELS=/srv/food-sticker-diary/models
 Environment=FOOD_BASE=/food-diary/
 Environment=FOOD_COOKIE_SECURE=1
+EnvironmentFile=-/etc/food-sticker-diary/network.env
 ExecStart=/srv/food-sticker-diary/.venv/bin/waitress-serve --listen=127.0.0.1:8792 --threads=4 app:app
 Restart=on-failure
 RestartSec=3

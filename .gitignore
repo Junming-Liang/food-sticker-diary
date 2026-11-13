@@ -6,3 +6,5 @@ models/
 data/
 .DS_Store
 .runtime/
+
+node_modules/

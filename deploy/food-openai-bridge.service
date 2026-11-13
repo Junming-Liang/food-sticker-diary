@@ -1,0 +1,15 @@
+# Install as a user service on the machine with working OpenAI connectivity.
+# Replace tecent_blog and port 18796 for other deployments.
+[Unit]
+Description=Food diary OpenAI TLS bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -R 127.0.0.1:18796:api.openai.com:443 tecent_blog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -21,10 +21,11 @@ def photo_data(mode='RGB'):
 
 class DiaryTest(unittest.TestCase):
     def setUp(self):
+        application._attempts.clear()
         self.alice = application.app.test_client(); self.bob = application.app.test_client(); self.visitor = application.app.test_client()
         suffix = os.urandom(6).hex()
-        self.alice.post('/api/auth/register',json={'username':'alice'+suffix,'password':'long-password'})
-        self.bob.post('/api/auth/register',json={'username':'bob'+suffix,'password':'long-password'})
+        self.assertEqual(self.alice.post('/api/auth/register',json={'username':'alice'+suffix,'password':'long-password'}).status_code,200)
+        self.assertEqual(self.bob.post('/api/auth/register',json={'username':'bob'+suffix,'password':'long-password'}).status_code,200)
 
     def test_private_meal_share_and_revoke(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试餐','grams':200,'calories':350,
@@ -87,6 +88,18 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.delete('/api/account',json={'password':'long-password'}).status_code,200)
         self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['paired'])
 
+    def test_exercise_is_private_and_editable(self):
+        payload={'day':'2026-11-13','name':'散步','minutes':30,'calories':120}
+        self.assertEqual(self.alice.post('/api/exercises',json=payload).status_code,201)
+        entry=self.alice.get('/api/exercises?day=2026-11-13').json['exercises'][0]
+        self.assertEqual(entry['calories'],120)
+        self.assertEqual(self.bob.get('/api/exercises?day=2026-11-13').json['exercises'],[])
+        self.assertEqual(self.bob.delete(f"/api/exercises/{entry['id']}").status_code,404)
+        payload['calories']=150
+        self.assertEqual(self.alice.put(f"/api/exercises/{entry['id']}",json=payload).status_code,200)
+        self.assertEqual(self.alice.get('/api/exercises?day=2026-11-13').json['exercises'][0]['calories'],150)
+        self.assertEqual(self.alice.delete(f"/api/exercises/{entry['id']}").status_code,200)
+
     def test_fasting_timer_is_private_and_records_actual_end(self):
         self.assertEqual(self.alice.post('/api/fasts',json={'goal_hours':16}).status_code,200)
         self.assertEqual(self.alice.post('/api/fasts',json={'goal_hours':16}).status_code,409)
@@ -131,6 +144,32 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.get('/api/me').json['user'],None)
         self.assertEqual(self.visitor.get(f'/api/shared/{token}').status_code,404)
 
+    def test_openai_tunnel_keeps_the_official_tls_hostname(self):
+        import ai
+        from unittest.mock import MagicMock
+        connection=ai.OpenAITunnelConnection(18796)
+        connection._context=MagicMock()
+        raw=MagicMock()
+        with patch.object(ai.socket,'create_connection',return_value=raw) as create:
+            connection.connect()
+        self.assertEqual(create.call_args.args[0],('127.0.0.1',18796))
+        self.assertEqual(connection._context.wrap_socket.call_args.kwargs['server_hostname'],'api.openai.com')
+
+    def test_openai_tunnel_sends_only_to_expected_path(self):
+        import ai
+        from unittest.mock import MagicMock
+        from urllib.request import Request
+        response=MagicMock(status=200)
+        response.read.return_value=b'{"ok":true}'
+        connection=MagicMock()
+        connection.getresponse.return_value=response
+        request=Request('https://api.openai.com/v1/chat/completions',data=b'{}',headers={'Authorization':'Bearer example'})
+        with patch.dict(os.environ,{'FOOD_OPENAI_TUNNEL_PORT':'18796'}), patch.object(ai,'OpenAITunnelConnection',return_value=connection) as factory:
+            self.assertEqual(ai.provider_response(request,'openai'),{'ok':True})
+        factory.assert_called_once_with(18796)
+        self.assertEqual(connection.request.call_args.args[:2],('POST','/v1/chat/completions'))
+        connection.close.assert_called_once()
+
     def test_vision_request(self):
         import json
         import ai
@@ -139,7 +178,7 @@ class DiaryTest(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def read(self,*args):return json.dumps({'choices':[{'message':{'content':json.dumps({'name':'米饭','grams':200,'calories':230,'carbs':50,'protein':5,'fat':1})}}]}).encode()
-        with patch.object(ai,'urlopen',return_value=Response()) as fake:
+        with patch.dict(os.environ, {'FOOD_OPENAI_TUNNEL_PORT':'18796'}), patch.object(ai,'urlopen',return_value=Response()) as fake:
             result=ai.vision_recognize(Image.new('RGB',(20,20)), 'deepseek', 'test-key', 'deepseek-flash')
             payload=json.loads(fake.call_args.args[0].data)
             self.assertEqual(result['name'],'米饭')

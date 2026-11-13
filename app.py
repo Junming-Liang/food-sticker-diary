@@ -95,6 +95,12 @@ def initialize():
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY(user_id, day)
         );
+        CREATE TABLE IF NOT EXISTS exercises (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, name TEXT NOT NULL, minutes INTEGER NOT NULL,
+            calories REAL NOT NULL, created INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS exercises_user_day ON exercises(user_id,day);
         CREATE TABLE IF NOT EXISTS fasts (
             id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             started INTEGER NOT NULL, ended INTEGER, goal_hours INTEGER NOT NULL
@@ -566,6 +572,51 @@ def water():
                      (g.user['id'],day,amount)); db().commit()
     row = db().execute('SELECT amount FROM water WHERE user_id=? AND day=?',(g.user['id'],day)).fetchone()
     return jsonify(amount=row['amount'] if row else 0)
+
+
+def exercise_fields(data):
+    day=str(data.get('day','')); name=str(data.get('name','')).strip()
+    if not valid_day(day): raise ValueError('请选择有效日期')
+    if not 1 <= len(name) <= 40: raise ValueError('请输入运动名称')
+    try:
+        minutes=int(data.get('minutes',0)); calories=float(data.get('calories',0))
+    except (TypeError,ValueError): raise ValueError('请填写有效的运动数据')
+    if not 1 <= minutes <= 1440 or not 0 <= calories <= 10000:
+        raise ValueError('请检查运动时长和消耗热量')
+    return day,name,minutes,round(calories,1)
+
+
+@app.route('/api/exercises', methods=['GET','POST'])
+@auth
+def exercises():
+    if request.method=='POST':
+        try: fields=exercise_fields(body())
+        except ValueError as exc: return jsonify(error=str(exc)),400
+        eid=secrets.token_hex(16)
+        db().execute('INSERT INTO exercises VALUES (?,?,?,?,?,?,?)',(eid,g.user['id'],*fields,int(time.time())))
+        db().commit()
+        return jsonify(ok=True),201
+    day=request.args.get('day','')
+    if not valid_day(day): return jsonify(error='请选择有效日期'),400
+    rows=db().execute('SELECT id,day,name,minutes,calories,created FROM exercises WHERE user_id=? AND day=? ORDER BY created DESC',
+                      (g.user['id'],day)).fetchall()
+    return jsonify(exercises=[dict(row) for row in rows])
+
+
+@app.route('/api/exercises/<eid>', methods=['PUT','DELETE'])
+@auth
+def exercise_detail(eid):
+    row=db().execute('SELECT * FROM exercises WHERE id=? AND user_id=?',(eid,g.user['id'])).fetchone()
+    if not row: abort(404)
+    if request.method=='DELETE':
+        db().execute('DELETE FROM exercises WHERE id=? AND user_id=?',(eid,g.user['id']))
+    else:
+        try: fields=exercise_fields(body())
+        except ValueError as exc: return jsonify(error=str(exc)),400
+        db().execute('UPDATE exercises SET day=?,name=?,minutes=?,calories=? WHERE id=? AND user_id=?',
+                     (*fields,eid,g.user['id']))
+    db().commit()
+    return jsonify(ok=True)
 
 
 @app.route('/api/fasts', methods=['GET','POST'])

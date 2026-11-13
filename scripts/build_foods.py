@@ -1,6 +1,6 @@
 """Build the small, Chinese-labelled food catalog from USDA SR Legacy CSV.
 
-Usage: python scripts/build_foods.py /path/to/FoodData_Central_sr_legacy_food_csv_2018-04.zip
+Usage: python scripts/build_foods.py /path/to/sr_legacy.zip /path/to/fndds_2021-2023.zip
 All nutrient amounts are per 100 g. Chinese names describe the source food and preparation.
 """
 import csv
@@ -54,10 +54,34 @@ FOODS = {
     '171413':('橄榄油','食用油 油脂'),
     '170317':('芝士披萨（普通饼底，烤熟）','披萨 匹萨 比萨'),
 }
+FNDDS = {
+    '2708951':('炒饭（无肉，参考配方）','炒饭 蛋炒饭 主食'),
+    '2708952':('炒饭（未注明配料，参考配方）','炒饭 主食'),
+    '2708953':('鸡肉炒饭（参考配方）','炒饭 鸡肉 主食'),
+    '2708954':('猪肉炒饭（参考配方）','炒饭 猪肉 主食'),
+    '2708956':('虾仁炒饭（参考配方）','炒饭 虾仁 主食'),
+    '2708708':('蒸馄饨或蒸饺（参考配方）','饺子 馄饨 抄手 点心'),
+    '2708705':('炸馄饨或煎饺（参考配方）','饺子 馄饨 锅贴 点心'),
+    '2709160':('馄饨汤（参考配方）','馄饨 抄手 汤'),
+    '2708959':('寿司（未注明种类，参考配方）','寿司 米饭'),
+    '2708963':('三文鱼寿司卷（参考配方）','寿司 三文鱼 米饭'),
+    '2708966':('蔬菜寿司卷（参考配方）','寿司 蔬菜 米饭'),
+    '2709153':('拉面（未注明配料，参考配方）','拉面 面条'),
+    '2709157':('素拉面（参考配方）','拉面 面条 素食'),
+    '2709158':('拉面（含肉和蛋，参考配方）','拉面 面条 鸡蛋 肉'),
+    '2708356':('米粉或米线（熟）','米线 米粉 面条'),
+    '2707455':('味噌汤或豆腐汤（参考配方）','味噌 汤 豆腐'),
+    '2706751':('酱油炒牛肉与蔬菜（参考配方）','炒牛肉 蔬菜 肉'),
+    '2706764':('木须肉（不含饼，参考配方）','木须肉 猪肉'),
+    '2707476':('酱油炒豆腐与蔬菜（参考配方）','豆腐 蔬菜'),
+    '2706607':('牛肉炒面（美式中餐参考配方）','牛肉 炒面 面条'),
+    '2708418':('米粥（参考配方）','粥 白粥 米粥'),
+    '2708984':('蛋粥（参考配方）','粥 鸡蛋 米粥'),
+}
 FIELDS = {'1008':'calories','1005':'carbs','1003':'protein','1004':'fat'}
 
 
-def main(path):
+def main(path, survey_path):
     with zipfile.ZipFile(path) as archive:
         def read_table(name):
             member=next(n for n in archive.namelist() if n.endswith('/'+name))
@@ -72,13 +96,22 @@ def main(path):
     for fdc_id,(name,keywords) in FOODS.items():
         if fdc_id not in descriptions or set(values[fdc_id]) != set(FIELDS.values()):
             raise ValueError(f'Missing required nutrient or food for FDC {fdc_id}')
-        foods.append(dict(id=fdc_id,name=name,keywords=keywords,source_name=descriptions[fdc_id],**values[fdc_id]))
-    output={'source':'USDA FoodData Central, SR Legacy, April 2018','unit':'per 100 g','foods':foods}
+        foods.append(dict(id=fdc_id,name=name,keywords=keywords,source_name=descriptions[fdc_id],dataset='SR Legacy 2018',**values[fdc_id]))
+    with zipfile.ZipFile(survey_path) as archive:
+        with archive.open('surveyDownload.json') as source:
+            survey={str(food['fdcId']):food for food in json.load(source)['SurveyFoods'] if str(food['fdcId']) in FNDDS}
+    for fdc_id,(name,keywords) in FNDDS.items():
+        item=survey[fdc_id]
+        values={FIELDS[str(n['nutrient']['id'])]:float(n['amount']) for n in item['foodNutrients']
+                if str(n['nutrient']['id']) in FIELDS and n.get('amount') is not None}
+        if set(values)!=set(FIELDS.values()): raise ValueError(f'Missing nutrient for FDC {fdc_id}')
+        foods.append(dict(id=fdc_id,name=name,keywords=keywords,source_name=item['description'],dataset='FNDDS 2021–2023',**values))
+    output={'source':'USDA FoodData Central, SR Legacy 2018 and FNDDS 2021–2023','unit':'per 100 g','foods':foods}
     dest=Path(__file__).resolve().parent.parent/'web'/'foods.json'
     dest.write_text(json.dumps(output,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     print(f'{len(foods)} foods written to {dest}')
 
 
 if __name__=='__main__':
-    if len(sys.argv)!=2: raise SystemExit(__doc__)
-    main(sys.argv[1])
+    if len(sys.argv)!=3: raise SystemExit(__doc__)
+    main(sys.argv[1],sys.argv[2])
