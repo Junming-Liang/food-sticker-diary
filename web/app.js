@@ -185,7 +185,7 @@ document.addEventListener('click',async event=>{
   if(action==='create-share'){button.disabled=true;state.shares=(await api('shares',{method:'POST',body:{day:state.day}})).shares;const link=state.shares[0];shareSheet();await copyShare(link.token);return}
   if(action==='copy-share'){await copyShare(button.dataset.token);return}
   if(action==='revoke'){await api(`shares/${button.dataset.id}`,{method:'DELETE'});state.shares=(await api('shares')).shares;shareSheet();toast('分享链接已撤销');return}
-  if(action==='delete-account'){openSheet(`${sheetTop('删除账号及数据')}<p class="sheet-description">此操作会永久删除账号、饮食照片、贴纸、体重、饮水和全部分享链接，无法恢复。</p><form id="delete-account-form"><label class="field"><span>输入密码以确认</span><input type="password" name="password" autocomplete="current-password" required></label><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button secondary" type="button" data-action="close">取消</button><button class="button" type="submit">永久删除</button></div></form>`);return}
+  if(action==='delete-account'){openSheet(`${sheetTop('删除账号及数据')}<p class="sheet-description">此操作会从应用中删除账号、饮食照片、贴纸、运动、体重、断食和全部分享链接，无法撤销。服务器已有备份不会自动删除，请由管理员单独处理。</p><form id="delete-account-form"><label class="field"><span>输入密码以确认</span><input type="password" name="password" autocomplete="current-password" required></label><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button secondary" type="button" data-action="close">取消</button><button class="button" type="submit">永久删除</button></div></form>`);return}
   if(action==='logout'){await api('auth/logout',{method:'POST',body:{}});state.user=null;state.meals=[];render();return}
  }catch(e){button.disabled=false;toast(e.message)}
 });
