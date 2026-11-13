@@ -23,4 +23,7 @@
 
 .macro-value{display:block;font-size:14px;line-height:20px;margin-top:4px;overflow-wrap:anywhere}.macro-value small{font-size:12px;font-weight:400;color:#686862}
 
+.record-actions{display:flex;align-items:center;gap:4px}
+.food-thumb:not([src]){background:#e8e8e3;border-radius:10px}
+
 .weight-chart{display:block;width:100%;height:120px;margin-top:12px}.chart-dates{display:flex;justify-content:space-between;color:#686862;font-size:12px;line-height:16px}

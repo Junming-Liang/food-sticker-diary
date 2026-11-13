@@ -12,9 +12,51 @@ const state={user:null,view:'today',day:today(),meals:[],exercises:[],water:0,la
 let toastTimer;
 const loaded={meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null};
 let loadVersion=0, mutationVersion=0;
+const pictureCache=new Map(),pictureRequests=new Map(),pictureObservers={};
+let pictureBytes=0,pictureGeneration=0;
 
-function invalidate(path){
+function clearPictureCache(){
+ pictureGeneration++;
+ for(const entry of pictureCache.values())URL.revokeObjectURL(entry.url);
+ pictureCache.clear();pictureRequests.clear();pictureBytes=0;
+}
+function pictureFromCache(url){
+ const entry=pictureCache.get(url);
+ if(!entry)return null;
+ if(Date.now()-entry.time>300000){pictureCache.delete(url);pictureBytes-=entry.size;URL.revokeObjectURL(entry.url);return null}
+ pictureCache.delete(url);pictureCache.set(url,entry);return entry.url;
+}
+function getPicture(url){
+ const cached=pictureFromCache(url);if(cached)return Promise.resolve(cached);
+ if(pictureRequests.has(url))return pictureRequests.get(url);
+ const generation=pictureGeneration;
+ const pending=fetch(url,{credentials:'same-origin',cache:'no-store'}).then(response=>{
+  if(!response.ok)throw new Error('图片加载失败');return response.blob();
+ }).then(blob=>{
+  if(generation!==pictureGeneration)return null;
+  const entry={url:URL.createObjectURL(blob),size:blob.size,time:Date.now()};
+  pictureCache.set(url,entry);pictureBytes+=entry.size;
+  while(pictureCache.size>48||pictureBytes>12*1024*1024){
+   const oldest=pictureCache.keys().next().value,removed=pictureCache.get(oldest);
+   pictureCache.delete(oldest);pictureBytes-=removed.size;URL.revokeObjectURL(removed.url);
+  }
+  return pictureCache.has(url)?entry.url:null;
+ }).catch(()=>null).finally(()=>{if(pictureRequests.get(url)===pending)pictureRequests.delete(url)});
+ pictureRequests.set(url,pending);return pending;
+}
+function hydratePictures(root){
+ const key=root===app?'app':'sheet';pictureObservers[key]?.disconnect();
+ const images=[...root.querySelectorAll('img[data-picture-src]')];
+ function load(img){const source=img.dataset.pictureSrc;getPicture(source).then(url=>{if(url&&img.isConnected&&img.dataset.pictureSrc===source)img.src=url})}
+ if(!('IntersectionObserver' in window)){images.forEach(load);return}
+ const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){observer.unobserve(entry.target);load(entry.target)}}),{rootMargin:'200px'});
+ pictureObservers[key]=observer;images.forEach(img=>observer.observe(img));
+}
+
+function invalidate(path,method){
  mutationVersion++;
+ if(path.startsWith('auth/')||path==='account'||(path.startsWith('meals/')&&(method==='DELETE'||path.endsWith('/sticker-style')))||
+    (path.startsWith('buddy')&&(method==='DELETE'||path==='buddy/sharing'))||(path.startsWith('shares/')&&method==='DELETE'))clearPictureCache();
  if(path.startsWith('auth/'))Object.assign(loaded,{meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null});
  if(path.startsWith('meals')){loaded.meals=null;loaded.weekly=null}
  if(path.startsWith('water'))loaded.water=null;
@@ -26,7 +68,7 @@ function invalidate(path){
 
 async function api(path, opts={}){
   const init={method:opts.method||'GET', credentials:'same-origin', headers:{}};
-  if(init.method!=='GET')invalidate(path);
+  if(init.method!=='GET')invalidate(path,init.method);
   if(opts.body instanceof FormData) init.body=opts.body;
   else if(opts.body!==undefined){init.headers['Content-Type']='application/json';init.body=JSON.stringify(opts.body)}
   const res=await fetch(`api/${path}`,init);
@@ -36,8 +78,8 @@ async function api(path, opts={}){
 }
 function toast(text){const el=$('#toast');el.textContent=text;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),3200)}
 function formError(form,message){const el=$('.form-error',form);if(el){el.textContent=message;el.classList.add('visible')}else toast(message)}
-function openSheet(content){sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();}
-function closeSheet(){if(sheet.open)sheet.close();state.scanVersion++}
+function openSheet(content){sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();hydratePictures(sheet)}
+function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();state.scanVersion++}
 function sheetTop(title){return `<div class="sheet-top"><h2 id="sheet-title">${esc(title)}</h2><button class="icon-button" type="button" data-action="close" aria-label="关闭">${icon('close')}</button></div>`}
 function round(n){return Math.round(Number(n)||0)}
 function total(meals,key){return meals.reduce((sum,item)=>sum+Number(item[key]||0),0)}
@@ -46,10 +88,10 @@ function pic(meal,kind='sticker',token=null){
   const wanted=kind==='sticker'&&meal.has_sticker?'sticker':(meal.has_photo?'photo':null);
   if(!wanted)return `<span class="empty-thumb">${icon('image')}</span>`;
   const url=token==='buddy'?`api/buddy/meals/${meal.id}/${wanted}`:token?`api/shared/${encodeURIComponent(token)}/image/${meal.id}/${wanted}`:`api/meals/${meal.id}/${wanted}`;
-  return `<img class="food-thumb" src="${url}?size=thumbnail" alt="${esc(meal.name)}" loading="lazy">`;
+  return `<img class="food-thumb" data-picture-src="${url}?size=thumbnail" alt="${esc(meal.name)}" decoding="async">`;
 }
 function nav(){return `<nav class="bottom-nav" aria-label="主要导航">
- ${[['today','home','记录'],['analysis','chart','分析'],['stickers','sticker','贴纸'],['fasting','timer','断食'],['profile','user','我的']].map(([view,ico,label])=>`<button class="nav-item ${state.view===view?'active':''}" data-action="nav" data-view="${view}" ${state.view===view?'aria-current="page"':''}>${icon(ico)}<span>${label}</span></button>`).join('')}
+ ${[['today','home','记录'],['analysis','chart','分析'],['buddy','buddy','搭子'],['fasting','timer','断食'],['profile','user','我的']].map(([view,ico,label])=>{const active=state.view===view||(view==='today'&&state.view==='stickers');return `<button class="nav-item ${active?'active':''}" data-action="nav" data-view="${view}" ${active?'aria-current="page"':''}>${icon(ico)}<span>${label}</span></button>`}).join('')}
  <button class="nav-add" data-action="add" aria-label="添加饮食记录">${icon('plus')}</button></nav>`}
 function topBar(title,sub='',actions=''){return `<header class="topbar"><div><h1 class="${title==='轻食日记'?'brand':'page-title'}">${title==='轻食日记'?'<span class="brand-mark"></span>':''}${esc(title)}</h1>${sub?`<div class="topbar-subtitle">${esc(sub)}</div>`:''}</div><div class="top-actions">${actions}</div></header>`}
 function dateStrip(){
@@ -73,7 +115,7 @@ function stickerGrid(meals,token=null){if(!meals.length)return `<div class="no-r
  return `<div class="sticker-grid">${meals.map(m=>`<div class="sticker-card"><button data-action="${token?'view-shared-meal':'edit'}" data-id="${m.id}">${pic(m,'sticker',token)}<strong>${esc(m.name)}</strong><small>${round(m.calories)} 千卡</small>${m.components?.length?`<small>${esc(m.components.map(item=>item.name).join(' · '))}</small>`:''}</button></div>`).join('')}</div>`}
 function exercisePanel(){const burned=total(state.exercises,'calories');return `<div class="section-head" style="margin-top:24px"><h2>运动记录</h2><button class="text-button" data-action="add-exercise">添加运动</button></div><section class="meal-group"><div class="meal-group-header"><div class="meal-title"><div class="meal-glyph">${icon('activity')}</div><div><strong>运动消耗</strong><small>${round(burned)} 千卡</small></div></div><button class="add-mini" data-action="add-exercise" aria-label="添加运动">${icon('plus')}</button></div>${state.exercises.length?`<div class="meal-entries">${state.exercises.map(e=>`<button class="meal-row" data-action="edit-exercise" data-id="${e.id}"><span class="empty-thumb">${icon('activity')}</span><span class="food-info"><strong>${esc(e.name)}</strong><small>${e.minutes} 分钟</small></span><span class="food-cal">${round(e.calories)} 千卡</span></button>`).join('')}</div>`:'<p class="empty-group">还没有运动记录</p>'}</section>`}
 function todayView(){const calendar=`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button>`;
- return `${topBar('轻食日记',dayTitle(),calendar)}${dateStrip()}${ring()}${macroGrid()}<div class="section-head"><h2>饮食记录</h2><div class="segmented" aria-label="记录显示方式"><button class="${state.layout==='list'?'active':''}" data-action="layout" data-layout="list" aria-label="列表" aria-pressed="${state.layout==='list'}">${icon('list')}</button><button class="${state.layout==='grid'?'active':''}" data-action="layout" data-layout="grid" aria-label="贴纸" aria-pressed="${state.layout==='grid'}">${icon('grid')}</button></div></div>${state.layout==='list'?mealGroups():stickerGrid(state.meals)}${exercisePanel()}`}
+ return `${topBar('轻食日记',dayTitle(),calendar)}${dateStrip()}${ring()}${macroGrid()}<div class="section-head"><h2>饮食记录</h2><div class="record-actions"><button class="text-button" data-action="nav" data-view="stickers">贴纸墙</button><div class="segmented" aria-label="记录显示方式"><button class="${state.layout==='list'?'active':''}" data-action="layout" data-layout="list" aria-label="列表" aria-pressed="${state.layout==='list'}">${icon('list')}</button><button class="${state.layout==='grid'?'active':''}" data-action="layout" data-layout="grid" aria-label="贴纸" aria-pressed="${state.layout==='grid'}">${icon('grid')}</button></div></div></div>${state.layout==='list'?mealGroups():stickerGrid(state.meals)}${exercisePanel()}`}
 function weightChart(){
  const entries=state.weights.filter(item=>item.day<=state.day).slice(0,14).reverse();
  if(!entries.length)return `<section class="panel"><div class="panel-top"><div><h2>体重趋势</h2><p class="panel-note">记录体重后可在这里回看</p></div><button class="text-button" data-action="weight">记录体重</button></div></section>`;
@@ -88,7 +130,7 @@ function analysisView(){
  const days=Array.from({length:7},(_,i)=>shiftDay(state.day,i-6));const amounts=days.map(day=>total(state.weekly.filter(m=>m.day===day),'calories'));const max=Math.max(state.user.target,...amounts,1);
  return `${topBar('分析','看看最近的饮食节奏',`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button>`)}<section class="panel"><div class="panel-top"><div><h2>热量摄入</h2><p class="panel-note">${dateLabel(days[0])} 至 ${dateLabel(days[6])}</p></div>${icon('chart')}</div><div class="bars" aria-label="最近七天热量摄入">${days.map((day,i)=>`<div class="bar-column"><span class="bar-value">${amounts[i]?round(amounts[i]):''}</span><span class="bar ${amounts[i]?'':'empty'}" style="height:${Math.max(2,Math.round(amounts[i]/max*105))}px"></span><span class="bar-label">${day.slice(-2)}日</span></div>`).join('')}</div></section><section class="panel"><h2>这一天</h2><div class="stat-line"><span>摄入热量</span><strong>${round(total(state.meals,'calories'))} 千卡</strong></div><div class="stat-line"><span>记录餐食</span><strong>${state.meals.length} 项</strong></div><div class="stat-line"><span>运动消耗</span><strong>${round(total(state.exercises,'calories'))} 千卡</strong></div><div class="stat-line"><span>饮水</span><strong>${state.water} 毫升</strong></div></section>${weightChart()}<p class="privacy-copy">营养数值为估算，可能因食材、份量和烹饪方式而不同。请结合实际情况调整。</p>`;
 }
-function stickersView(){return `${topBar('食物贴纸',dayTitle(),`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button>`)}${dateStrip()}<div class="share-banner"><h2>把今天的饮食分享给搭子</h2><p>对方可以查看当天的餐食和贴纸，原照片不会分享。自动抠图可能保留部分背景，请先查看贴纸。</p><button class="button" data-action="share">${icon('share')}分享这一天</button><button class="text-button" data-action="buddy">查看我的搭子</button></div>${stickerGrid(state.meals)}`}
+function stickersView(){return `${topBar('食物贴纸',dayTitle(),`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button><button class="icon-button" data-action="nav" data-view="today" aria-label="返回记录">${icon('back')}</button>`)}${dateStrip()}<div class="share-banner"><h2>把今天的饮食分享给搭子</h2><p>对方可以查看当天的餐食和贴纸，原照片不会分享。自动抠图可能保留部分背景，请先查看贴纸。</p><button class="button" data-action="share">${icon('share')}分享这一天</button><button class="text-button" data-action="buddy">查看我的搭子</button></div>${stickerGrid(state.meals)}`}
 function duration(seconds){const s=Math.max(0,Math.floor(seconds)),h=String(Math.floor(s/3600)).padStart(2,'0'),m=String(Math.floor(s%3600/60)).padStart(2,'0'),sec=String(s%60).padStart(2,'0');return `${h}:${m}:${sec}`}
 function fastingView(){
  const active=state.fasts.find(f=>!f.ended);const elapsed=active?Math.max(0,Date.now()/1000-active.started):0;const ratio=active?Math.min(1,elapsed/(active.goal_hours*3600)):0;
@@ -97,20 +139,22 @@ function fastingView(){
 }
 function buddyView(){
  const b=state.buddy;
- const back=`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button><button class="icon-button" data-action="nav" data-view="profile" aria-label="返回我的">${icon('back')}</button>`;
+ const back=`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button>`;
  if(!b?.paired)return `${topBar('我的搭子','和朋友一起记录',back)}<section class="share-banner"><h2>一起记录，互相陪伴</h2><p>发送邀请并由对方确认后，你们可以互看每日热量与食物贴纸。双方可分别暂停共享或解除绑定。</p><button class="button" data-action="invite-buddy">${icon('share')}邀请搭子</button></section><div class="no-records">${icon('user')}<strong>还没有绑定搭子</strong><p>邀请链接 24 小时内有效，每个人同时只能绑定一位搭子</p></div>`;
  return `${topBar('我的搭子',`${b.username} · ${dateLabel(state.day)}`,back)}${dateStrip()}<section class="panel"><div class="panel-top"><div><h2>与 ${esc(b.username)} 共享</h2><p class="panel-note">${b.sharing?'对方可以查看你的热量和贴纸':'你已暂停向对方共享'}</p></div>${icon('user')}</div><div class="inline-actions" style="margin-top:12px"><button class="button secondary" data-action="toggle-buddy" data-enabled="${!b.sharing}">${b.sharing?'暂停我的共享':'恢复我的共享'}</button><button class="text-button danger" data-action="confirm-unbind">解除绑定</button></div></section><div class="section-head"><h2>${esc(b.username)} 的饮食</h2></div>${b.other_sharing?`<section class="panel"><div class="stat-line"><span>当天摄入</span><strong>${round(total(b.meals,'calories'))} / ${round(b.target)} 千卡</strong></div><div class="stat-line"><span>记录食物</span><strong>${b.meals.length} 项</strong></div></section>${stickerGrid(b.meals,'buddy')}`:`<div class="no-records">${icon('lock')}<strong>对方已暂停共享</strong><p>恢复共享后可以继续查看</p></div>`}`;
 }
 function profileView(){const username=esc(state.user.username);return `${topBar('我的')}<div class="account"><div class="avatar">${esc(state.user.username.slice(0,1).toUpperCase())}</div><div><strong>${username}</strong><small>记录每一餐，照顾好自己</small></div></div><section class="panel"><div class="panel-top"><div><h2>今天喝水了吗</h2><p class="panel-note">每次增减 250 毫升</p></div>${icon('drop')}</div><div class="water-line"><div class="water-count"><strong>${state.water}</strong> <span>毫升</span></div><div class="stepper"><button data-action="water" data-amount="-250" aria-label="减少饮水">−</button><button data-action="water" data-amount="250" aria-label="增加饮水">+</button></div></div></section><div class="setting-list"><button class="setting-row" data-action="settings">${icon('spark')}<span>热量目标与识别设置<small>每日 ${state.user.target} 千卡 · ${state.user.provider==='local'?'本地识别':esc(state.user.provider)}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="weight">${icon('weight')}<span>体重记录<small>${state.weights.length?`${state.weights[0].weight} 千克 · ${state.weights[0].day}`:'记录今天的体重'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="buddy">${icon('user')}<span>我的搭子<small>互看每日热量和食物贴纸</small></span>${icon('chevron')}</button><button class="setting-row" data-action="manage-shares">${icon('share')}<span>分享管理<small>查看或撤销分享链接</small></span>${icon('chevron')}</button></div><button class="button outline full" data-action="logout">退出登录</button><button class="text-button danger" data-action="delete-account" style="display:block;margin:10px auto 0">删除账号及数据</button><p class="privacy-copy">你的饮食数据默认仅自己可见，只有主动创建分享链接后其他人才能查看对应日期。识别结果仅供日常参考。</p>`}
 function render(){
- if(state.shareToken){renderShared();return}
+ if(state.shareToken){renderShared();hydratePictures(app);return}
  if(!state.user){renderAuth();return}
  const content=state.view==='today'?todayView():state.view==='analysis'?analysisView():state.view==='stickers'?stickersView():state.view==='buddy'?buddyView():state.view==='fasting'?fastingView():profileView();
  app.innerHTML=`<main id="main" class="screen">${content}</main>${nav()}`;
+ hydratePictures(app);
 }
 function renderAuth(mode='login'){
  const registering=mode==='register';
  app.innerHTML=`<main id="main" class="auth-screen"><img class="auth-logo" src="icon-192.png" alt=""><h1>把每一餐，<br>轻轻记下来。</h1><p class="intro">拍照记录饮食，留下食物贴纸。<br>从今天开始，更了解自己的每一餐。</p>${state.buddyToken?'<p class="panel-note">登录后可查看搭子邀请，并决定是否共享。</p>':''}<form id="auth-form" data-mode="${mode}"><label class="field"><span>用户名</span><input name="username" autocomplete="username" required minlength="2" maxlength="32" placeholder="输入用户名"></label><label class="field"><span>密码</span><input name="password" type="password" autocomplete="${registering?'new-password':'current-password'}" minlength="8" maxlength="128" required placeholder="至少 8 位"></label><p class="form-error" role="alert"></p><button class="button full" type="submit">${registering?'创建账号':'登录'}</button></form><p class="auth-switch">${registering?'已经有账号？':'还没有账号？'}<button data-action="auth-mode" data-mode="${registering?'login':'register'}">${registering?'直接登录':'创建账号'}</button></p><p class="auth-foot">数据默认仅自己可见，分享由你决定。<br>食物热量与营养为估算值，请按实际情况调整。</p></main>`;
+ hydratePictures(app);
 }
 function renderShared(){
  if(!state.shared){app.innerHTML=`<main id="main" class="screen no-nav">${topBar('查看分享')}<div class="no-records">${icon('lock')}<strong>分享链接无效或已过期</strong><p>请联系分享者重新发送链接</p></div><p><a href="./" class="button secondary">打开轻食日记</a></p></main>`;return}
@@ -128,11 +172,13 @@ function viewReady(view,day){
 function renderViewLoading(view,error=false){
  const titles={today:'轻食日记',analysis:'分析',stickers:'食物贴纸',fasting:'轻断食',profile:'我的',buddy:'我的搭子'};
  app.innerHTML=`<main id="main" class="screen">${topBar(titles[view])}<div class="loading-page" role="status">${error?'<p>暂时无法加载，请重试。</p><button class="button secondary" data-action="retry-view">重新加载</button>':'<span class="loading-line"></span><span class="loading-line short"></span><p class="panel-note">正在加载…</p>'}</div></main>${nav()}`;
+ hydratePictures(app);
 }
 async function loadView({instant=false}={}){
  const view=state.view,day=state.day,user=state.user,version=++loadVersion,mutation=mutationVersion;
  const current=()=>version===loadVersion&&state.user===user&&state.view===view&&state.day===day&&mutation===mutationVersion;
- if(instant){if(viewReady(view,day))render();else renderViewLoading(view)}
+ const renderedCached=instant&&viewReady(view,day);
+ if(instant){if(renderedCached)render();else renderViewLoading(view)}
  const jobs=[];
  const add=(key,path,field,marker)=>jobs.push(api(path).then(result=>({key,value:field?result[field]:result,marker})));
  if(view==='today'||view==='analysis'||view==='stickers')add('meals',`meals?day=${day}`,'meals',day);
@@ -145,8 +191,9 @@ async function loadView({instant=false}={}){
  try{
   const results=await Promise.all(jobs);
   if(!current())return;
+  const changed=results.some(({key,value})=>JSON.stringify(state[key])!==JSON.stringify(value));
   for(const {key,value,marker} of results){state[key]=value;loaded[key]=marker}
-  render();
+  if(!renderedCached||changed)render();
  }catch(error){if(!current())return;if(instant&&!viewReady(view,day))renderViewLoading(view,true);throw error}
 }
 function addSheet(category){state.category=category||'breakfast';openSheet(`${sheetTop('记录一餐')}<p class="sheet-description">拍下眼前的食物，或直接填写你吃了什么。</p><button class="quick-option" data-action="camera"><span class="icon-wrap">${icon('camera')}</span><span><strong>拍照识别</strong><small>拍一张照片，生成食物贴纸</small></span></button><button class="quick-option" data-action="gallery"><span class="icon-wrap">${icon('image')}</span><span><strong>从相册选择</strong><small>上传已有的食物照片</small></span></button><button class="quick-option" data-action="food-library"><span class="icon-wrap">${icon('list')}</span><span><strong>食物库</strong><small>搜索常见食材，按重量估算营养</small></span></button><button class="quick-option" data-action="manual"><span class="icon-wrap">${icon('plus')}</span><span><strong>手动记录</strong><small>自己填写食物和营养信息</small></span></button>`)}
