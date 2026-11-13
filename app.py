@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,79 @@ DATA = Path(os.environ.get('FOOD_DATA', ROOT / 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
 UPLOADS = DATA / 'images'
 UPLOADS.mkdir(exist_ok=True, mode=0o700)
+IMAGE_TOTAL_LIMIT = int(os.environ.get('FOOD_IMAGE_TOTAL_LIMIT_MB', '4096')) * 1024**2
+IMAGE_USER_LIMIT = int(os.environ.get('FOOD_IMAGE_USER_LIMIT_MB', '1024')) * 1024**2
+IMAGE_FREE_RESERVE = 2 * 1024**3
+if IMAGE_TOTAL_LIMIT <= 0 or IMAGE_USER_LIMIT <= 0:
+    raise ValueError('Image storage limits must be positive')
+_image_usage = {'scanned':0.0, 'total':0, 'users':{}}
+
+
+class StorageLimitError(ValueError):
+    pass
+
+
+def image_usage():
+    # minimal: one process owns uploads; periodically reconcile external changes.
+    if time.monotonic() - _image_usage['scanned'] < 30 and _image_usage['scanned']:
+        return _image_usage
+    total=0; users={}
+    def scan_error(error): raise error
+    for folder in os.scandir(UPLOADS):
+        if not folder.is_dir(follow_symlinks=False): continue
+        amount=0
+        for root,_,files in os.walk(folder.path,followlinks=False,onerror=scan_error):
+            for name in files:
+                try:
+                    path=os.path.join(root,name);item=os.stat(path,follow_symlinks=False)
+                    if not stat.S_ISREG(item.st_mode): continue
+                    if re.fullmatch(r'(?:avatar\.jpg|[a-f0-9]{32}\.(?:jpg|png)(?:\.(?:thumb|small)(?:\.webp)?)?)\.[a-f0-9]{16}\.tmp',name) and item.st_mtime<time.time()-86400:
+                        try: os.unlink(path);continue
+                        except OSError: pass
+                    amount+=item.st_size
+                except FileNotFoundError: pass
+        users[folder.name]=amount;total+=amount
+    _image_usage.update(scanned=time.monotonic(),total=total,users=users)
+    return _image_usage
+
+
+def adjust_image_usage(user_id, delta):
+    if _image_usage['scanned']:
+        key=str(user_id)
+        _image_usage['total']+=delta
+        _image_usage['users'][key]=_image_usage['users'].get(key,0)+delta
+
+
+def write_image(user_id, path, content):
+    """Bound storage and atomically publish one image under the image lock."""
+    with _image_lock:
+        usage=image_usage()
+        try: old_size=path.stat().st_size
+        except FileNotFoundError: old_size=0
+        delta=len(content)-old_size
+        if shutil.disk_usage(DATA).free < IMAGE_FREE_RESERVE + len(content):
+            raise StorageLimitError('服务器剩余空间不足，暂时无法保存图片')
+        if delta>0 and (usage['total']+delta>IMAGE_TOTAL_LIMIT or usage['users'].get(str(user_id),0)+delta>IMAGE_USER_LIMIT):
+            raise StorageLimitError('图片存储空间已满，请清理预览或不需要的记录后再试')
+        temporary=path.with_name(path.name+'.'+secrets.token_hex(8)+'.tmp')
+        try:
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as output: output.write(content)
+            os.replace(temporary,path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        adjust_image_usage(user_id,delta)
+
+
+def avatar_path(user_id):
+    return UPLOADS / str(user_id) / 'avatar.jpg'
+
+
+def avatar_version(user_id):
+    try: return str(avatar_path(user_id).stat().st_mtime_ns)
+    except FileNotFoundError: return None
+
+
 KEY_FILE = DATA / 'secret.key'
 if not KEY_FILE.exists():
     try:
@@ -217,7 +291,7 @@ def valid_day(value):
 def public_user(user):
     options={row['provider']:{'model':row['model'],'has_key':bool(row['api_key'])}
              for row in db().execute('SELECT provider,model,api_key FROM provider_settings WHERE user_id=?',(user['id'],))}
-    return {'id':user['id'], 'username':user['username'], 'target':user['target'],
+    return {'id':user['id'], 'username':user['username'], 'target':user['target'], 'avatar_version':avatar_version(user['id']),
             'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key']),
             'provider_options':options,
             'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal'],
@@ -359,6 +433,7 @@ def delete_account():
     # Remove the image files before deleting the account so an I/O error remains retryable.
     folder = UPLOADS / str(user_id)
     if folder.is_dir(): shutil.rmtree(folder)
+    _image_usage['scanned']=0.0
     db().execute('DELETE FROM buddy_pairs WHERE id IN (SELECT pair_id FROM buddy_members WHERE user_id=?)', (user_id,))
     db().execute('DELETE FROM users WHERE id=?', (user_id,)); db().commit()
     response = jsonify(ok=True,push_removed=push_removed); response.delete_cookie('food_session', path=BASE)
@@ -446,6 +521,61 @@ def clean_image(file):
         return image
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
         raise ValueError('无法读取照片，请换一张图片') from exc
+
+
+@app.route('/api/avatar', methods=['GET','PUT','DELETE'])
+@auth
+@serialized_images
+def avatar():
+    path=avatar_path(g.user['id'])
+    if request.method in ('GET','HEAD'): return send_avatar(path)
+    if request.method=='DELETE':
+        remove_image(g.user['id'],path.name)
+        return jsonify(user=public_user(g.user))
+    file=request.files.get('image')
+    if not file: return jsonify(error='请选择头像图片'),400
+    try:
+        with Image.open(file) as original:
+            if original.format not in ('JPEG','PNG','WEBP') or original.width*original.height>8_000_000:
+                raise ValueError('请选择尺寸合适的 JPG、PNG 或 WebP 图片')
+            original=ImageOps.exif_transpose(original).convert('RGBA')
+            image=Image.new('RGB',original.size,'white');image.paste(original,mask=original.getchannel('A'))
+            image=ImageOps.fit(image,(256,256),Image.Resampling.LANCZOS)
+            output=io.BytesIO();image.save(output,format='JPEG',quality=82,optimize=True)
+        path.parent.mkdir(exist_ok=True,mode=0o700)
+        write_image(g.user['id'],path,output.getvalue())
+    except StorageLimitError as exc: return jsonify(error=str(exc)),400
+    except (ValueError,UnidentifiedImageError,Image.DecompressionBombError,OSError):
+        return jsonify(error='无法保存头像，请换一张图片后重试'),400
+    return jsonify(user=public_user(g.user))
+
+
+def send_avatar(path):
+    if not path.is_file(): abort(404)
+    response=send_file(path,mimetype='image/jpeg',conditional=True)
+    g.private_thumbnail=True
+    return response
+
+
+@app.get('/api/storage')
+@auth
+def storage():
+    with _image_lock:
+        amount=image_usage()['users'].get(str(g.user['id']),0)
+    return jsonify(used=amount,limit=IMAGE_USER_LIMIT)
+
+
+@app.delete('/api/storage/previews')
+@auth
+@serialized_images
+def clear_previews():
+    folder=UPLOADS / str(g.user['id']);removed=0
+    if folder.is_dir():
+        for item in os.scandir(folder):
+            if re.fullmatch(r'[a-f0-9]{32}\.(?:jpg|png)\.(?:thumb|small)(?:\.webp)?',item.name) and item.is_file(follow_symlinks=False):
+                size=item.stat(follow_symlinks=False).st_size
+                os.unlink(item.path);removed+=size;adjust_image_usage(g.user['id'],-size)
+    return jsonify(removed=removed,used=image_usage()['users'].get(str(g.user['id']),0),limit=IMAGE_USER_LIMIT)
 
 
 # minimal: a single photo job bounds memory on the shared server; a busy user can retry.
@@ -590,22 +720,13 @@ def publish_thumbnail(path, content, suffix='.thumb'):
     with _image_lock:
         if not path.is_file(): return None
         if target.is_file(): return target
-        if shutil.disk_usage(DATA).free < 2 * 1024**3: return None
-        temporary = target.with_name(target.name + '.' + secrets.token_hex(8) + '.tmp')
-        try:
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'wb') as output: output.write(content)
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        try: write_image(path.parent.name,target,content)
+        except StorageLimitError: return None
         return target
 
 
 def save_image(data_url, user_id, kind):
     if not data_url: return None
-    # Leave room for the other services that share this filesystem.
-    if shutil.disk_usage(DATA).free < 2 * 1024**3:
-        raise ValueError('服务器存储空间不足，暂时无法保存照片')
     expected = 'data:image/jpeg;base64,' if kind == 'photo' else 'data:image/png;base64,'
     if not isinstance(data_url,str) or not data_url.startswith(expected) or len(data_url) > 10_000_000:
         raise ValueError('图片格式不正确')
@@ -619,12 +740,14 @@ def save_image(data_url, user_id, kind):
         folder = UPLOADS / str(user_id); folder.mkdir(exist_ok=True, mode=0o700)
         name = secrets.token_hex(16) + ('.jpg' if kind == 'photo' else '.png')
         path = folder / name
-        image.save(path, format='JPEG' if kind=='photo' else 'PNG')
-        os.chmod(path, 0o600)
+        content=io.BytesIO();image.save(content,format='JPEG' if kind=='photo' else 'PNG')
+        write_image(user_id,path,content.getvalue())
         # A missing preview is harmless; existing images are also generated lazily.
         try: publish_thumbnail(path, thumbnail_bytes(image, kind))
-        except OSError: app.logger.warning('Could not cache an image preview')
+        except (OSError,ValueError): app.logger.warning('Could not cache an image preview')
         return name
+    except StorageLimitError:
+        raise
     except (ValueError, UnidentifiedImageError, OSError) as exc:
         raise ValueError('无法保存照片') from exc
 
@@ -632,9 +755,11 @@ def save_image(data_url, user_id, kind):
 def remove_image(user_id, name):
     if name:
         path = UPLOADS / str(user_id) / Path(name).name
-        path.unlink(missing_ok=True)
-        for suffix in ('.thumb','.thumb.webp','.small','.small.webp'):
-            path.with_name(path.name + suffix).unlink(missing_ok=True)
+        for suffix in ('','.thumb','.thumb.webp','.small','.small.webp'):
+            target=path.with_name(path.name+suffix)
+            try: size=target.stat().st_size;target.unlink()
+            except FileNotFoundError: continue
+            adjust_image_usage(user_id,-size)
 
 
 def meal_json(row, shared=False):
@@ -731,7 +856,6 @@ def update_sticker_style(mid):
         if border:
             source=UPLOADS / str(g.user['id']) / Path(row['sticker']).name
             if not source.is_file(): abort(404)
-            if shutil.disk_usage(DATA).free < 2 * 1024**3: return jsonify(error='服务器存储空间不足，暂时无法保存贴纸'),400
             with Image.open(source) as image:
                 image=ai.sanitize_sticker(image)
                 radius=max(1,min(16,round(max(image.size)*(.006 if border==1 else .012))))
@@ -742,11 +866,15 @@ def update_sticker_style(mid):
                 rendered=Image.new('RGBA',size,(*rgb,0));rendered.putalpha(outline);rendered.alpha_composite(image,(radius,radius))
             new_name=secrets.token_hex(16)+'.png'
             path=UPLOADS / str(g.user['id']) / new_name
-            rendered.save(path,format='PNG');os.chmod(path,0o600)
+            content=io.BytesIO();rendered.save(content,format='PNG')
+            write_image(g.user['id'],path,content.getvalue())
             try: publish_thumbnail(path,thumbnail_bytes(rendered,'sticker'))
             except OSError: app.logger.warning('Could not cache an image preview')
         db().execute('UPDATE meals SET sticker_rendered=?,sticker_border=?,sticker_color=? WHERE id=? AND user_id=?',
                      (new_name,border,color,mid,g.user['id']));db().commit()
+    except StorageLimitError as exc:
+        remove_image(g.user['id'],new_name)
+        return jsonify(error=str(exc)),400
     except (OSError,ValueError):
         remove_image(g.user['id'],new_name)
         return jsonify(error='无法保存贴纸，请稍后重试'),400
@@ -819,6 +947,7 @@ def buddy():
     day=request.args.get('day','')
     if not valid_day(day): return jsonify(error='请选择有效的日期'),400
     result = {'paired':True, 'username':other['username'], 'sharing':bool(own['sharing']),
+              'avatar_version':avatar_version(other['user_id']) if other['sharing'] else None,
               'other_sharing':bool(other['sharing']), 'target':other['target'] if other['sharing'] else None,
               'meal_split':json.loads(other['meal_split']) if other['sharing'] and other['meal_split'] else None, 'meals':[]}
     if other['sharing']:
@@ -826,6 +955,18 @@ def buddy():
                             (other['user_id'],day)).fetchall()
         result['meals'] = [meal_json(row, shared=True) for row in rows]
     return jsonify(result)
+
+
+@app.get('/api/buddy/avatar')
+@auth
+@serialized_images
+def buddy_avatar():
+    own=own_buddy()
+    if not own: abort(404)
+    other=db().execute('SELECT user_id FROM buddy_members WHERE pair_id=? AND user_id<>? AND sharing=1',
+                       (own['pair_id'],g.user['id'])).fetchone()
+    if not other: abort(404)
+    return send_avatar(avatar_path(other['user_id']))
 
 
 @app.post('/api/buddy/invites')

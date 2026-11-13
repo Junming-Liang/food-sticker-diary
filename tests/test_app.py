@@ -293,6 +293,113 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(response.status_code,400)
         self.assertEqual(self.alice.get('/api/meals?day=2026-11-13').json['meals'],[])
 
+    def test_avatar_is_bounded_replaceable_and_shared_only_with_buddy_consent(self):
+        def image_file(color):
+            out=io.BytesIO();Image.new('RGBA',(640,480),color).save(out,'PNG');out.seek(0)
+            return {'image':(out,'avatar.png')}
+        user_id=self.alice.get('/api/me').json['user']['id']
+        self.assertEqual(self.alice.get('/api/avatar').status_code,404)
+        response=self.alice.put('/api/avatar',data=image_file((220,30,20,255)))
+        self.assertEqual(response.status_code,200);self.assertTrue(response.json['user']['avatar_version'])
+        avatar=self.alice.get('/api/avatar')
+        self.assertEqual(Image.open(io.BytesIO(avatar.data)).size,(256,256))
+        self.assertEqual(avatar.headers['Cache-Control'],'private, no-cache, max-age=0, must-revalidate')
+        etag=avatar.headers['ETag']
+        avatar.close()
+        head=self.alice.head('/api/avatar');self.assertEqual(head.status_code,200);head.close()
+        self.assertEqual(self.bob.get('/api/avatar').status_code,404)
+        self.assertEqual(self.visitor.get('/api/avatar').status_code,401)
+        self.assertEqual(self.bob.get('/api/buddy/avatar').status_code,404)
+        invite=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':invite})
+        self.assertTrue(self.bob.get('/api/buddy?day=2026-11-13').json['avatar_version'])
+        avatar=self.bob.get('/api/buddy/avatar');self.assertEqual(avatar.status_code,200);avatar.close()
+        self.alice.put('/api/buddy/sharing',json={'enabled':False})
+        self.assertIsNone(self.bob.get('/api/buddy?day=2026-11-13').json['avatar_version'])
+        self.assertEqual(self.bob.get('/api/buddy/avatar',headers={'If-None-Match':etag}).status_code,404)
+        share=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]
+        self.assertNotIn('avatar_version',self.visitor.get(f"/api/shared/{share['token']}").json)
+        self.assertEqual(self.visitor.get(f"/api/shared/{share['token']}/avatar").status_code,404)
+        for index in range(3):
+            self.assertEqual(self.alice.put('/api/avatar',data=image_file((30,index*50,80,255))).status_code,200)
+        folder=application.UPLOADS/str(user_id)
+        self.assertEqual([path.name for path in folder.iterdir()],['avatar.jpg'])
+        before=(folder/'avatar.jpg').read_bytes()
+        from types import SimpleNamespace
+        with patch.object(application.shutil,'disk_usage',return_value=SimpleNamespace(free=0)):
+            self.assertEqual(self.alice.put('/api/avatar',data=image_file((50,60,70,255))).status_code,400)
+        self.assertEqual((folder/'avatar.jpg').read_bytes(),before)
+        with patch.object(application.os,'replace',side_effect=OSError('simulated write failure')):
+            self.assertEqual(self.alice.put('/api/avatar',data=image_file((50,60,70,255))).status_code,400)
+        self.assertEqual((folder/'avatar.jpg').read_bytes(),before)
+        self.assertEqual([path.name for path in folder.iterdir()],['avatar.jpg'])
+        self.assertEqual(self.alice.put('/api/avatar',data={'image':(io.BytesIO(b'not an image'),'bad.jpg')}).status_code,400)
+        self.assertEqual((folder/'avatar.jpg').read_bytes(),before)
+        self.assertEqual(self.alice.delete('/api/avatar').status_code,200)
+        self.assertEqual(self.alice.get('/api/avatar').status_code,404)
+        self.assertFalse((folder/'avatar.jpg').exists())
+
+    def test_storage_quota_and_preview_cleanup_preserve_originals(self):
+        user_id=self.alice.get('/api/me').json['user']['id']
+        payload={'day':'2026-11-13','category':'lunch','name':'测试','calories':100,
+                 'photo':photo_data(),'sticker':photo_data('RGBA')}
+        with patch.object(application,'IMAGE_USER_LIMIT',1):
+            self.assertEqual(self.alice.post('/api/meals',json=payload).status_code,400)
+        self.assertEqual(self.alice.get('/api/meals?day=2026-11-13').json['meals'],[])
+        photo=Image.open(io.BytesIO(base64.b64decode(payload['photo'].split(',')[1]))).convert('RGB')
+        encoded=io.BytesIO();photo.save(encoded,format='JPEG')
+        photo_limit=len(encoded.getvalue())+len(application.thumbnail_bytes(photo,'photo'))
+        with patch.object(application,'IMAGE_USER_LIMIT',photo_limit):
+            self.assertEqual(self.bob.post('/api/meals',json=payload).status_code,400)
+        self.assertEqual(self.bob.get('/api/storage').json['used'],0)
+        self.assertEqual(self.bob.get('/api/meals?day=2026-11-13').json['meals'],[])
+        mid=self.alice.post('/api/meals',json=payload).json['meal']['id']
+        with application.app.app_context():
+            row=application.db().execute('SELECT image,sticker FROM meals WHERE id=?',(mid,)).fetchone()
+            folder=application.UPLOADS/str(user_id)
+            originals=[folder/row['image'],folder/row['sticker']]
+            self.assertTrue(all(path.is_file() for path in originals))
+        image=self.alice.get(f'/api/meals/{mid}/sticker?size=small&format=webp');self.assertEqual(image.status_code,200);image.close()
+        before=self.alice.get('/api/storage').json['used']
+        response=self.alice.delete('/api/storage/previews')
+        self.assertEqual(response.status_code,200);self.assertGreater(response.json['removed'],0)
+        self.assertEqual(response.json['used'],before-response.json['removed'])
+        self.assertTrue(all(path.is_file() for path in originals))
+        image=self.alice.get(f'/api/meals/{mid}/photo');self.assertEqual(image.status_code,200);image.close()
+        image=self.alice.get(f'/api/meals/{mid}/sticker');self.assertEqual(image.status_code,200);image.close()
+        with application._image_lock:
+            total=application.image_usage()['total']
+        with patch.object(application,'IMAGE_TOTAL_LIMIT',total):
+            self.assertEqual(self.bob.post('/api/meals',json=payload).status_code,400)
+            self.assertEqual(self.alice.get(f'/api/meals/{mid}/sticker?size=thumbnail').status_code,200)
+            self.assertFalse(originals[1].with_name(originals[1].name+'.thumb').exists())
+
+        stale=folder/('a'*32+'.jpg.'+'b'*16+'.tmp');fresh=folder/('c'*32+'.png.'+'d'*16+'.tmp');unrelated=folder/'keep.tmp'
+        for path in (stale,fresh,unrelated): path.write_bytes(b'test')
+        os.utime(stale,(time.time()-90000,time.time()-90000))
+        with application._image_lock:
+            application._image_usage['scanned']=0;application.image_usage()
+        self.assertFalse(stale.exists());self.assertTrue(fresh.exists());self.assertTrue(unrelated.exists())
+
+    def test_parallel_image_writes_cannot_exceed_quota(self):
+        from pathlib import Path
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix='food-quota-test-') as directory:
+            folder=Path(directory)/'7';folder.mkdir()
+            counters={'scanned':0.0,'total':0,'users':{}}
+            with patch.object(application,'UPLOADS',Path(directory)),patch.object(application,'_image_usage',counters), \
+                 patch.object(application,'IMAGE_USER_LIMIT',100),patch.object(application,'IMAGE_TOTAL_LIMIT',100), \
+                 patch.object(application.shutil,'disk_usage',return_value=SimpleNamespace(free=application.IMAGE_FREE_RESERVE+1000)):
+                def write(index):
+                    try: application.write_image(7,folder/f'{index}.jpg',b'x'*60);return True
+                    except application.StorageLimitError: return False
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    results=list(executor.map(write,range(4)))
+                self.assertEqual(results.count(True),1)
+                self.assertEqual(sum(path.stat().st_size for path in folder.iterdir()),60)
+                self.assertEqual(application.image_usage()['total'],60)
+
     def test_photo_jobs_are_bounded(self):
         application._photo_lock.acquire()
         try:
@@ -595,9 +702,14 @@ class DiaryTest(unittest.TestCase):
     def test_delete_account_revokes_shares_and_data(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
         self.assertEqual(self.alice.post('/api/meals',json=meal).status_code,201)
+        user_id=self.alice.get('/api/me').json['user']['id']
+        image=io.BytesIO();Image.new('RGB',(16,16),'red').save(image,'JPEG');image.seek(0)
+        self.assertEqual(self.alice.put('/api/avatar',data={'image':(image,'avatar.jpg')}).status_code,200)
+        self.assertTrue(application.avatar_path(user_id).is_file())
         token=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]['token']
         self.assertEqual(self.alice.delete('/api/account',json={'password':'wrong'}).status_code,401)
         self.assertEqual(self.alice.delete('/api/account',json={'password':'long-password'}).status_code,200)
+        self.assertFalse((application.UPLOADS/str(user_id)).exists())
         self.assertEqual(self.alice.get('/api/me').json['user'],None)
         self.assertEqual(self.visitor.get(f'/api/shared/{token}').status_code,404)
 

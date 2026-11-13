@@ -12,7 +12,7 @@ function shiftDay(day, amount){const d=new Date(`${day}T12:00:00`);d.setDate(d.g
 function dateLabel(day){const d=new Date(`${day}T12:00:00`);return `${d.getMonth()+1}月${d.getDate()}日`}
 const cats=[['breakfast','早餐','sun'],['lunch','午餐','spark'],['dinner','晚餐','sticker'],['snack','加餐','plus']];
 const state={user:null,view:'today',day:today(),meals:[],exercises:[],water:0,layout:'list',category:'breakfast',categoryAuto:true,image:null,shares:[],weights:[],weekly:[],fasts:[],foods:[],foodRef:null,nutritionEdited:false,shareToken:new URL(location.href).searchParams.get('share'),shared:null,buddy:null,buddyToken:new URL(location.href).searchParams.get('invite'),scanVersion:0};
-let toastTimer,scanPreviewUrl=null,foodLibraryDraft=null;
+let toastTimer,scanPreviewUrl=null,foodLibraryDraft=null,avatarDraft=null,avatarPreviewUrl=null,avatarDraftVersion=0;
 const initialParams=new URL(location.href).searchParams;
 let pendingBuddyDay=initialParams.get('view')==='buddy'?(validNoticeDay(initialParams.get('day'))?initialParams.get('day'):today()):null;
 const loaded={meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null};
@@ -61,7 +61,7 @@ function hydratePictures(root){
 
 function invalidate(path,method){
  mutationVersion++;
- if(path.startsWith('auth/')||path==='account'||(path.startsWith('meals/')&&(method==='DELETE'||path.endsWith('/sticker-style')))||
+ if(path.startsWith('auth/')||path==='account'||path==='avatar'||(path.startsWith('meals/')&&(method==='DELETE'||path.endsWith('/sticker-style')))||
     (path.startsWith('buddy')&&(method==='DELETE'||path==='buddy/sharing'))||(path.startsWith('shares/')&&method==='DELETE'))clearPictureCache();
  if(path.startsWith('auth/'))Object.assign(loaded,{meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null});
  if(path.startsWith('meals')){loaded.meals=null;loaded.weekly=null}
@@ -84,8 +84,9 @@ async function api(path, opts={}){
 }
 function toast(text){const el=$('#toast');el.textContent=text;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),3200)}
 function formError(form,message){const el=$(':scope > .form-error',form)||$('.form-error',form);if(el){el.textContent=message;el.classList.add('visible')}else toast(message)}
-function openSheet(content){sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();hydratePictures(sheet)}
-function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();if(scanPreviewUrl){URL.revokeObjectURL(scanPreviewUrl);scanPreviewUrl=null}state.scanVersion++}
+function clearAvatarDraft(){avatarDraftVersion++;avatarDraft=null;if(avatarPreviewUrl){URL.revokeObjectURL(avatarPreviewUrl);avatarPreviewUrl=null}}
+function openSheet(content){clearAvatarDraft();sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();hydratePictures(sheet)}
+function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();clearAvatarDraft();if(scanPreviewUrl){URL.revokeObjectURL(scanPreviewUrl);scanPreviewUrl=null}state.scanVersion++}
 function applyPendingBuddy(){
  if(!pendingBuddyDay)return;
  state.view='buddy';state.day=pendingBuddyDay;pendingBuddyDay=null;
@@ -95,6 +96,7 @@ sheet.addEventListener('cancel',event=>{event.preventDefault();closeSheet()});
 function sheetTop(title){return `<div class="sheet-top"><h2 id="sheet-title">${esc(title)}</h2><button class="icon-button" type="button" data-action="close" aria-label="关闭">${icon('close')}</button></div>`}
 function round(n){return Math.round(Number(n)||0)}
 function total(meals,key){return meals.reduce((sum,item)=>sum+Number(item[key]||0),0)}
+function userAvatar(name,version,path){return `<span class="avatar" aria-hidden="true">${esc(name.slice(0,1).toUpperCase())}${version?`<img class="avatar-image" src="${path}?v=${encodeURIComponent(version)}" alt="">`:''}</span>`}
 function dayTitle(){return state.day===today()?`今天 · ${dateLabel(state.day)}`:dateLabel(state.day)}
 function pic(meal,kind='sticker',token=null,size='thumbnail'){
   const wanted=kind==='sticker'&&meal.has_sticker?'sticker':(meal.has_photo?'photo':null);
@@ -161,9 +163,9 @@ function buddyView(){
  const b=state.buddy;
  const back=`<button class="icon-button" data-action="calendar" aria-label="选择日期">${icon('calendar')}</button>`;
  if(!b?.paired)return `${topBar('我的搭子','和朋友一起记录',back)}<section class="share-banner"><h2>一起记录，互相陪伴</h2><p>发送邀请并由对方确认后，你们可以互看每日热量、餐食的记录时间与食物贴纸。双方可分别暂停共享或解除绑定。</p><button class="button" data-action="invite-buddy">${icon('share')}邀请搭子</button></section><div class="no-records">${icon('user')}<strong>还没有绑定搭子</strong><p>邀请链接 24 小时内有效，每个人同时只能绑定一位搭子</p></div>`;
- return `${topBar('我的搭子',dateLabel(state.day),back)}${dateStrip()}<section class="buddy-identity"><div class="avatar">${esc(b.username.slice(0,1).toUpperCase())}</div><div class="buddy-identity-text"><strong>${esc(b.username)}</strong><small>${b.sharing?'你正在向对方共享':'你已暂停向对方共享'}</small></div><button class="text-button" data-action="buddy-settings">共享设置</button></section>${b.other_sharing?`${ring(b.meals,[],b.target,true)}${macroGrid(b.meals,{})}<div class="section-head"><h2>饮食记录</h2><span class="section-sub">对方的记录 · 只读</span></div>${b.meal_split?'<p class="meal-target-note">餐次目标按对方当前每日目标分配</p>':''}${mealGroups(b.meals,'buddy',b.meal_split,b.target)}`:`<div class="no-records">${icon('lock')}<strong>对方已暂停共享</strong><p>恢复共享后可以继续查看</p></div>`}`;
+ return `${topBar('我的搭子',dateLabel(state.day),back)}${dateStrip()}<section class="buddy-identity">${userAvatar(b.username,b.avatar_version,'api/buddy/avatar')}<div class="buddy-identity-text"><strong>${esc(b.username)}</strong><small>${b.sharing?'你正在向对方共享':'你已暂停向对方共享'}</small></div><button class="text-button" data-action="buddy-settings">共享设置</button></section>${b.other_sharing?`${ring(b.meals,[],b.target,true)}${macroGrid(b.meals,{})}<div class="section-head"><h2>饮食记录</h2><span class="section-sub">对方的记录 · 只读</span></div>${b.meal_split?'<p class="meal-target-note">餐次目标按对方当前每日目标分配</p>':''}${mealGroups(b.meals,'buddy',b.meal_split,b.target)}`:`<div class="no-records">${icon('lock')}<strong>对方已暂停共享</strong><p>恢复共享后可以继续查看</p></div>`}`;
 }
-function profileView(){const username=esc(state.user.username);return `${topBar('我的')}<div class="account"><div class="avatar">${esc(state.user.username.slice(0,1).toUpperCase())}</div><div><strong>${username}</strong><small>记录每一餐，照顾好自己</small></div></div><section class="panel"><div class="panel-top"><div><h2>今天喝水了吗</h2><p class="panel-note">每次增减 250 毫升</p></div>${icon('drop')}</div><div class="water-line"><div class="water-count"><strong>${state.water}</strong> <span>毫升</span></div><div class="stepper"><button data-action="water" data-amount="-250" aria-label="减少饮水">−</button><button data-action="water" data-amount="250" aria-label="增加饮水">+</button></div></div></section><div class="setting-list"><button class="setting-row" data-action="settings">${icon('spark')}<span>热量目标与识别设置<small>每日 ${state.user.target} 千卡 · ${state.user.provider==='local'?'本地识别':esc(state.user.provider)}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="meal-split">${icon('chart')}<span>餐次热量分配<small>${state.user.meal_split?'已设置四餐比例':'按比例分配每日目标'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="weight">${icon('weight')}<span>体重记录<small>${state.weights.length?`${state.weights[0].weight} 千克 · ${state.weights[0].day}`:'记录今天的体重'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="buddy">${icon('user')}<span>我的搭子<small>互看每日热量和食物贴纸</small></span>${icon('chevron')}</button><button class="setting-row" data-action="push-settings">${icon('bell')}<span>搭子更新提醒<small>搭子记录新餐食时通知本机</small></span>${icon('chevron')}</button><button class="setting-row" data-action="manage-shares">${icon('share')}<span>分享管理<small>查看或撤销分享链接</small></span>${icon('chevron')}</button></div><button class="button outline full" data-action="logout">退出登录</button><button class="text-button danger" data-action="delete-account" style="display:block;margin:10px auto 0">删除账号及数据</button><p class="privacy-copy">饮食数据默认仅自己可见。搭子共享开启或主动创建分享链接后，对方可查看对应餐食、记录时间和贴纸。识别结果仅供日常参考。</p>`}
+function profileView(){const username=esc(state.user.username);return `${topBar('我的')}<div class="account"><button class="avatar-edit-button" data-action="avatar-settings" aria-label="设置头像">${userAvatar(state.user.username,state.user.avatar_version,'api/avatar')}<span class="avatar-edit-badge">${icon('camera')}</span></button><div><strong>${username}</strong><small>记录每一餐，照顾好自己</small><button class="avatar-change" data-action="avatar-settings">${state.user.avatar_version?'更换头像':'设置头像'}</button></div></div><section class="panel"><div class="panel-top"><div><h2>今天喝水了吗</h2><p class="panel-note">每次增减 250 毫升</p></div>${icon('drop')}</div><div class="water-line"><div class="water-count"><strong>${state.water}</strong> <span>毫升</span></div><div class="stepper"><button data-action="water" data-amount="-250" aria-label="减少饮水">−</button><button data-action="water" data-amount="250" aria-label="增加饮水">+</button></div></div></section><div class="setting-list"><button class="setting-row" data-action="settings">${icon('spark')}<span>热量目标与识别设置<small>每日 ${state.user.target} 千卡 · ${state.user.provider==='local'?'本地识别':esc(state.user.provider)}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="meal-split">${icon('chart')}<span>餐次热量分配<small>${state.user.meal_split?'已设置四餐比例':'按比例分配每日目标'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="weight">${icon('weight')}<span>体重记录<small>${state.weights.length?`${state.weights[0].weight} 千克 · ${state.weights[0].day}`:'记录今天的体重'}</small></span>${icon('chevron')}</button><button class="setting-row" data-action="buddy">${icon('user')}<span>我的搭子<small>互看每日热量和食物贴纸</small></span>${icon('chevron')}</button><button class="setting-row" data-action="push-settings">${icon('bell')}<span>搭子更新提醒<small>搭子记录新餐食时通知本机</small></span>${icon('chevron')}</button><button class="setting-row" data-action="storage">${icon('image')}<span>存储空间<small>查看用量和清理预览</small></span>${icon('chevron')}</button><button class="setting-row" data-action="manage-shares">${icon('share')}<span>分享管理<small>查看或撤销分享链接</small></span>${icon('chevron')}</button></div><button class="button outline full" data-action="logout">退出登录</button><button class="text-button danger" data-action="delete-account" style="display:block;margin:10px auto 0">删除账号及数据</button><p class="privacy-copy">饮食数据默认仅自己可见。搭子共享开启或主动创建分享链接后，对方可查看对应餐食、记录时间和贴纸。识别结果仅供日常参考。</p>`}
 function render(){
  if(state.shareToken){renderShared();hydratePictures(app);return}
  if(!state.user){renderAuth();return}
@@ -310,6 +312,9 @@ function stickerEditor(meal){
 }
 function exerciseForm(item=null){const editing=Boolean(item);openSheet(`${sheetTop(editing?'编辑运动':'记录运动')}<p class="sheet-description">填写运动设备或其他来源提供的消耗数据，热量将计入当天总览。</p><form id="exercise-form" data-id="${item?.id||''}"><label class="field"><span>运动名称</span><input name="name" maxlength="40" required placeholder="例如：散步" value="${esc(item?.name||'')}"></label><label class="field"><span>日期</span><input type="date" name="day" value="${item?.day||state.day}" required></label><div class="form-grid"><label class="field"><span>时长 · 分钟</span><input type="number" name="minutes" min="1" max="1440" step="1" required value="${item?.minutes??''}"></label>${numberField('calories','消耗 · 千卡',item?.calories??'',true)}</div><p class="form-error" role="alert"></p><div class="sheet-footer">${editing?`<button class="button secondary danger" type="button" data-action="confirm-delete-exercise" data-id="${item.id}">删除</button>`:''}<button class="button" type="submit">保存运动</button></div></form>`)}
 function settingsSheet(){const u=state.user;openSheet(`${sheetTop('目标与识别设置')}<form id="settings-form"><label class="field"><span>每日热量目标 · 千卡</span><input type="number" name="target" value="${u.target}" min="500" max="10000" required><small>默认目标仅为初始值，请根据自己的情况调整。</small></label><div class="form-grid three">${[['carbs_goal','碳水 · 克'],['protein_goal','蛋白质 · 克'],['fat_goal','脂肪 · 克']].map(([field,label])=>`<label class="field"><span>${label}</span><input type="number" name="${field}" min="0.1" max="2000" step="0.1" placeholder="不设置" value="${esc(u[field]??'')}"></label>`).join('')}</div><p class="panel-note">营养目标可按个人需要填写，留空表示不设置。</p><label class="field"><span>照片识别服务</span><select name="provider"><option value="local" ${u.provider==='local'?'selected':''}>本地识别</option><option value="deepseek" ${u.provider==='deepseek'?'selected':''}>DeepSeek</option><option value="openai" ${u.provider==='openai'?'selected':''}>OpenAI</option></select></label><div id="provider-fields" ${u.provider==='local'?'hidden':''}><label class="field"><span>模型名称</span><input name="model" value="${esc(u.model)}" placeholder="输入支持图片的模型名称"><small>DeepSeek 推荐 deepseek-flash，deepseek-v4-pro 暂不支持图片；OpenAI 默认 gpt-4o-mini。</small></label><label class="field"><span>API 密钥</span><input name="api_key" type="password" autocomplete="off" placeholder="${u.has_key?'已配置；留空保持不变':'输入你的 API 密钥'}"><small>两家服务的密钥分开加密保存，留空可保留已保存的密钥。识别照片会发送至所选服务商，并可能产生费用。</small></label><label><input type="checkbox" name="clear_key"> <span class="panel-note">清除当前保存的密钥</span></label>${u.provider==='openai'&&u.has_key?'<p><button class="text-button" type="button" data-action="check-openai">检测已保存的 OpenAI 配置</button></p>':''}</div><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button" type="submit">保存设置</button></div></form>`)}
+function avatarSheet(){openSheet(`${sheetTop('设置头像')}<div id="avatar-editor"><div class="avatar-preview">${userAvatar(state.user.username,state.user.avatar_version,'api/avatar')}</div><p class="avatar-note">图片会居中裁剪并自动压缩。搭子共享开启时对方可以查看头像，公开分享链接不会展示头像。</p><input id="avatar-file" type="file" accept="image/*" hidden><p id="avatar-error" class="form-error" role="alert"></p><button class="button secondary full" type="button" data-action="choose-avatar">选择图片</button><button class="button full avatar-save" type="button" data-action="save-avatar" disabled>保存头像</button>${state.user.avatar_version?'<button class="text-button danger avatar-remove" type="button" data-action="remove-avatar">移除头像</button>':''}</div>`)}
+function spaceLabel(bytes){return bytes>=1024**3?`${(bytes/1024**3).toFixed(1)} GB`:`${(bytes/1024**2).toFixed(2)} MB`}
+function storageSheet(info){const percent=Math.min(100,Math.round(info.used/info.limit*100));openSheet(`${sheetTop('存储空间')}<div class="storage-summary"><span>我的图片用量</span><strong>${spaceLabel(info.used)} <small>/ ${spaceLabel(info.limit)}</small></strong><div class="storage-track" role="progressbar" aria-label="图片空间使用比例" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percent}%"></span></div></div><p class="avatar-note">头像、餐食照片、贴纸和预览都计入用量。清理预览后可自动重新生成，不会删除原照片和贴纸。</p><button class="button secondary full" data-action="clear-previews">清理预览缓存</button><p class="panel-note storage-footnote">空间不足时会暂停保存新图片，已有记录不会自动删除。</p>`)}
 function shareSheet(){const links=state.shares.map(s=>`<div class="share-item"><div>${esc(s.day)}<small>有效至 ${new Date(s.expires*1000).toLocaleDateString('zh-CN')}</small></div><button class="text-button" data-action="copy-share" data-token="${esc(s.token)}">复制</button><button class="text-button danger" data-action="revoke" data-id="${s.id}">撤销</button></div>`).join('');
  openSheet(`${sheetTop('分享管理')}<p class="sheet-description">链接可查看对应日期的餐食、记录时间和贴纸，原照片不会分享。自动抠图可能保留部分背景，请先查看贴纸。链接 7 天后自动失效，也可随时撤销。</p><button class="button full" data-action="create-share">${icon('share')}生成 ${dateLabel(state.day)} 的分享链接</button><div style="margin-top:16px">${links||'<p class="panel-note">还没有有效的分享链接。</p>'}</div>`)}
 function buddySettingsSheet(){const buddy=state.buddy;if(!buddy?.paired)return;openSheet(`${sheetTop('共享设置')}<p class="sheet-description">${buddy.sharing?'对方可以查看你的热量、餐食的记录时间和食物贴纸。':'你已暂停向对方共享。'}原照片不会分享，双方都可以随时暂停或解除绑定。</p><button class="button secondary full" data-action="toggle-buddy" data-enabled="${!buddy.sharing}">${buddy.sharing?'暂停我的共享':'恢复我的共享'}</button><button class="button outline full push-settings-entry" data-action="push-settings">搭子更新提醒</button><button class="text-button danger buddy-unbind" data-action="confirm-unbind">解除绑定</button>`)}
@@ -390,6 +395,24 @@ async function disablePush(button){
  }catch(error){if(panel.isConnected)pushError(panel,error.message||'无法关闭提醒，请稍后重试')}
  finally{button.disabled=false}
 }
+async function prepareAvatar(file){
+ if(!file)return;const panel=$('#avatar-editor',sheet);if(!panel)return;
+ const version=++avatarDraftVersion,error=$('#avatar-error',panel),save=$('[data-action="save-avatar"]',panel),source=URL.createObjectURL(file);
+ error.classList.remove('visible');save.disabled=true;avatarDraft=null;
+ try{
+  const image=await new Promise((resolve,reject)=>{const item=new Image();item.onload=()=>resolve(item);item.onerror=()=>reject(new Error('无法读取图片，请换一张'));item.src=source});
+  if(image.naturalWidth*image.naturalHeight>40_000_000)throw new Error('图片尺寸过大，请选择较小的图片');
+  const side=Math.min(image.naturalWidth,image.naturalHeight),canvas=document.createElement('canvas');canvas.width=canvas.height=256;
+  const context=canvas.getContext('2d');context.fillStyle='#fff';context.fillRect(0,0,256,256);
+  context.drawImage(image,(image.naturalWidth-side)/2,(image.naturalHeight-side)/2,side,side,0,0,256,256);
+  const blob=await new Promise((resolve,reject)=>canvas.toBlob(value=>value?resolve(value):reject(new Error('无法处理图片')),'image/jpeg',.84));
+  if(!panel.isConnected||version!==avatarDraftVersion)return;
+  if(avatarPreviewUrl)URL.revokeObjectURL(avatarPreviewUrl);avatarPreviewUrl=URL.createObjectURL(blob);avatarDraft=blob;
+  const preview=$('.avatar-preview .avatar',panel);let img=$('img',preview);if(!img){img=document.createElement('img');img.alt='';img.className='avatar-image';preview.append(img)}img.src=avatarPreviewUrl;save.disabled=false;
+ }catch(e){if(panel.isConnected&&version===avatarDraftVersion){error.textContent=e.message;error.classList.add('visible')}}
+ finally{URL.revokeObjectURL(source)}
+}
+
 async function preparePhoto(file){
  if(!file)return;const version=++state.scanVersion;
  if(scanPreviewUrl)URL.revokeObjectURL(scanPreviewUrl);
@@ -491,6 +514,15 @@ document.addEventListener('click',async event=>{
   if(action==='delete-weight'){await api(`weights/${button.dataset.day}`,{method:'DELETE'});state.weights=(await api('weights')).weights;weightSheet();render();toast('体重记录已删除');return}
   if(action==='weight'){weightSheet();return}
   if(action==='water'){const amount=Math.max(0,Math.min(10000,state.water+Number(button.dataset.amount)));state.water=(await api('water',{method:'PUT',body:{day:state.day,amount}})).amount;render();return}
+  if(action==='avatar-settings'){avatarSheet();return}
+  if(action==='choose-avatar'){$('#avatar-file',sheet).click();return}
+  if(action==='save-avatar'){
+   if(!avatarDraft)return;button.disabled=true;const panel=button.closest('#avatar-editor'),userId=state.user.id,data=new FormData();data.append('image',avatarDraft,'avatar.jpg');
+   const result=await api('avatar',{method:'PUT',body:data});if(state.user?.id!==userId)return;state.user=result.user;if(panel.isConnected)closeSheet();render();toast('头像已更新');return;
+  }
+  if(action==='remove-avatar'){button.disabled=true;const panel=button.closest('#avatar-editor'),userId=state.user.id,result=await api('avatar',{method:'DELETE'});if(state.user?.id!==userId)return;state.user=result.user;if(panel.isConnected)closeSheet();render();toast('头像已移除');return}
+  if(action==='storage'){button.disabled=true;const info=await api('storage');if(button.isConnected){button.disabled=false;storageSheet(info)}return}
+  if(action==='clear-previews'){button.disabled=true;const info=await api('storage/previews',{method:'DELETE'});if(button.isConnected){storageSheet(info);toast(info.removed?`已清理 ${spaceLabel(info.removed)} 预览`:'暂无可清理的预览')}return}
   if(action==='share'||action==='manage-shares'){state.shares=(await api('shares')).shares;shareSheet();return}
   if(action==='create-share'){button.disabled=true;state.shares=(await api('shares',{method:'POST',body:{day:state.day}})).shares;const link=state.shares[0];shareSheet();await copyShare(link.token);return}
   if(action==='copy-share'){await copyShare(button.dataset.token);return}
@@ -550,6 +582,7 @@ document.addEventListener('keydown',event=>{
 });
 
 document.addEventListener('change',event=>{
+ if(event.target.id==='avatar-file'){const file=event.target.files[0];event.target.value='';prepareAvatar(file);return}
  const mealFormElement=event.target.closest('#meal-form');
  if(mealFormElement&&event.target.name==='category')mealFormElement.dataset.categoryAuto='0';
  if(mealFormElement&&event.target.name==='record_time'){mealFormElement.dataset.timeAuto='0';inferMealCategory(mealFormElement)}
@@ -563,6 +596,8 @@ document.addEventListener('change',event=>{
   $('[name="clear_key"]',sheet).checked=false;
  }
 });
+
+document.addEventListener('error',event=>{if(event.target.matches?.('img.avatar-image'))event.target.remove()},true);
 
 setInterval(()=>{const clock=$('#fast-clock[data-started]');if(!clock)return;const elapsed=Math.max(0,Date.now()/1000-Number(clock.dataset.started));clock.textContent=duration(elapsed);const ring=$('#fast-ring');if(ring)ring.setAttribute('stroke-dasharray',`${(Math.min(1,elapsed/(Number(clock.dataset.goal)*3600))*427.3).toFixed(1)} 427.3`)},1000);
 
