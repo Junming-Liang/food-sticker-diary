@@ -112,7 +112,7 @@ const password = `test-${randomBytes(16).toString('hex')}`;
                     {name:'鸡蛋',grams:50,calories:78,carbs:0.5,protein:6,fat:5}];
     await owner.route('**/api/analyze',async route => {await new Promise(resolve=>setTimeout(resolve,800));await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
       source:'deepseek',photo:photo.jpeg,sticker:photo.png,
-      estimate:{name:'一份餐食',grams:150,calories:208,carbs:28.5,protein:9,fat:5.3,components:detected}
+      estimate:{name:'一份餐食',grams:150,calories:208,carbs:28.5,protein:9,fat:5.3,components:detected,alternatives:['螺蛳粉','酸辣粉'],uncertainty_note:'汤底需要确认'}
     })})});
     await owner.getByRole('button',{name:'添加饮食记录'}).click();
     await owner.getByRole('button',{name:/从相册选择/}).click();
@@ -133,6 +133,29 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await owner.locator('#gallery-input').setInputFiles({name:'meal.jpg',mimeType:'image/jpeg',buffer:Buffer.from(photo.jpeg.split(',')[1],'base64')});
     await owner.locator('#meal-form').waitFor();
     assert.equal(await owner.locator('.food-component').count(),2);
+    await owner.getByRole('button',{name:'螺蛳粉',exact:true}).click();
+    assert.equal(await owner.locator('#meal-form [name=name]').inputValue(),'螺蛳粉');
+    assert.match(await owner.locator('#nutrition-note').innerText(),/仍为原估算/);
+    await owner.locator('#meal-form [name=category]').selectOption('dinner');
+    await owner.getByText('识别不准？补充菜名或配料').click();
+    await owner.getByLabel('食物说明').fill('这是螺蛳粉，有酸笋和腐竹');
+    let retryAttempts=0;
+    await owner.route('**/api/reanalyze',async route=>{
+      retryAttempts++;
+      assert.ok(route.request().postDataBuffer().includes(Buffer.from('这是螺蛳粉')));
+      const body=retryAttempts===1?{error:'模拟识别失败'}:{source:'deepseek',estimate:{name:'螺蛳粉',grams:150,calories:208,carbs:28.5,protein:9,fat:5.3,components:detected}};
+      await route.fulfill({status:retryAttempts===1?503:200,contentType:'application/json',body:JSON.stringify(body)});
+    });
+    await owner.getByRole('button',{name:'根据说明重新识别'}).click();
+    await owner.getByText('模拟识别失败').waitFor();
+    assert.equal(await owner.locator('#meal-form [name=name]').inputValue(),'螺蛳粉');
+    assert.equal(await owner.locator('.food-component').count(),2);
+    await owner.getByLabel('食物说明').press('Enter');
+    await owner.getByText('重新识别完成，请核对结果').waitFor();
+    assert.equal(await owner.locator('#meal-form [name=name]').inputValue(),'螺蛳粉');
+    assert.equal(await owner.locator('#meal-form [name=category]').inputValue(),'dinner');
+    await owner.locator('#meal-form [name=name]').fill('一份餐食');
+    await owner.unroute('**/api/reanalyze');
     await owner.locator('.food-component').first().locator('[data-component-field=calories]').fill('150');
     assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'228');
     await owner.locator('.food-component').first().locator('[data-component-field=grams]').fill('200');
@@ -216,6 +239,14 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await visitor.reload();await visitor.getByText('分享链接无效或已过期').waitFor();
     await visitor.close();await owner.getByRole('button',{name:'关闭'}).click();
 
+    await owner.evaluate(async ({day,previous,photo})=>{
+      for(const meal of [{day,category:'lunch',name:'番茄炒蛋',calories:220,sticker:photo.png,photo:photo.jpeg},
+                         {day,category:'dinner',name:'螺蛳粉',calories:460},
+                         {day:previous,category:'lunch',name:'昨日米线',calories:320}]){
+        const response=await fetch('api/meals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(meal)});
+        if(!response.ok)throw new Error('Could not create test meal');
+      }
+    },{day,previous,photo});
     await owner.locator('.bottom-nav').getByRole('button',{name:'搭子',exact:true}).click();
     const inviteResponse=owner.waitForResponse(r => r.url().endsWith('/api/buddy/invites') && r.request().method()==='POST');
     await owner.getByRole('button',{name:'邀请搭子'}).click();
@@ -224,12 +255,40 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await buddy.goto(inviteUrl.href);await signup(buddy,1);
     await buddy.getByRole('heading',{name:'搭子邀请'}).waitFor();
     await buddy.getByRole('button',{name:'接受邀请'}).click();
-    await buddy.locator('.sticker-card strong').getByText('白米饭（熟，无盐）').waitFor();
+    const group=label=>buddy.locator('.meal-group').filter({hasText:label});
+    await group('早餐').getByText('白米饭（熟，无盐）').waitFor();
+    await group('午餐').getByText('番茄炒蛋').waitFor();
+    await group('晚餐').getByText('螺蛳粉').waitFor();
+    assert.equal(await buddy.locator('.meal-group .add-mini').count(),0);
+    const buddySticker=group('午餐').locator('img.food-thumb');
+    await buddySticker.scrollIntoViewIfNeeded();
+    await buddySticker.waitFor({state:'visible'});
+    await buddy.waitForFunction(()=>{const image=document.querySelector('.meal-group img[alt="番茄炒蛋"]');return image?.src.startsWith('blob:')&&image.naturalWidth>0});
+    const buddyPhotoStatus=await buddySticker.evaluate(async image=>{
+      const url=image.dataset.pictureSrc.replace('/sticker?','/photo?');
+      return (await fetch(url)).status;
+    });
+    assert.equal(buddyPhotoStatus,404);
+    await group('午餐').getByRole('button',{name:/番茄炒蛋/}).click();
+    await buddy.locator('dialog .stat-line').getByText('220 千卡').waitFor();
+    assert.equal(await buddy.locator('dialog input').count(),0);
+    await buddy.getByRole('button',{name:'关闭'}).click();
+    await buddy.getByRole('button',{name:'选择日期'}).click();
+    await buddy.locator('#date-form [name=day]').fill(previous);
+    await buddy.getByRole('button',{name:'查看记录'}).click();
+    await group('午餐').getByText('昨日米线').waitFor();
+    assert.equal(await group('午餐').getByText('番茄炒蛋').count(),0);
+    await buddy.getByRole('button',{name:'选择日期'}).click();
+    await buddy.locator('#date-form [name=day]').fill(day);
+    await buddy.getByRole('button',{name:'查看记录'}).click();
+    await group('晚餐').getByText('螺蛳粉').waitFor();
     await owner.reload();await owner.locator('.bottom-nav').getByRole('button',{name:'搭子',exact:true}).click();
+    await owner.getByRole('button',{name:'共享设置'}).click();
     await owner.getByRole('button',{name:'暂停我的共享'}).click();
     await owner.getByText('共享状态已更新').waitFor();
     await buddy.reload();await buddy.locator('.bottom-nav').getByRole('button',{name:'搭子',exact:true}).click();
     await buddy.getByText('对方已暂停共享').waitFor();
+    await buddy.getByRole('button',{name:'共享设置'}).click();
     await buddy.getByRole('button',{name:'解除绑定'}).click();
     await buddy.getByRole('button',{name:'确认解除'}).click();
     await buddy.getByText('还没有绑定搭子').waitFor();

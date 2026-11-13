@@ -161,7 +161,7 @@ def provider_response(req, provider):
             if response.status >= 400:
                 raise HTTPError(req.full_url, response.status, 'API request failed', response.headers,
                                 io.BytesIO(response.read(65536)))
-            return json.loads(response.read(2 * 1024 * 1024))
+            return json.load(response)
         finally:
             conn.close()
     with urlopen(req, timeout=75) as response:
@@ -183,25 +183,35 @@ def check_openai_model(key, model):
         raise ValueError('无法连接 OpenAI，请检查网络后重试') from exc
 
 
-def vision_recognize(image, provider, key, model):
+def vision_recognize(image, provider, key, model, hint=''):
     # Fixed provider URLs avoid exposing the server to user-supplied URL requests.
     endpoints = {'openai': 'https://api.openai.com/v1/chat/completions',
                  'deepseek': 'https://api.deepseek.com/chat/completions'}
-    prompt = ('识别照片中的餐食并分项估算。只返回 JSON 对象，name 为整餐简体中文名称，'
-              'components 为数组，每项包含 name（简体中文）、grams（克）、calories（千卡）、'
-              'carbs、protein、fat（后三者单位为克）。按可辨认的食物分项，最多 12 项；'
-              '估算整份实际重量和营养，数值须为非负数字；不要凭不清晰的外观强行确定菜名或隐藏的食材。'
-              '菜名、食材或份量不确定时使用较宽泛的名称，并在 uncertainty_note 中简短说明不确定之处，'
-              '提醒用户核对；确定时 uncertainty_note 为空字符串。不要添加 Markdown。')
+    if provider == 'deepseek' and model == 'deepseek-v4-pro':
+        raise ValueError('当前 deepseek-v4-pro 不支持图片，请在设置中改用 deepseek-flash')
+    prompt = ('请识别这张餐食照片，重视中式地方菜。先综合观察主食形态、汤汁和可见配料，'
+              '再给出最可能的具体中文菜名，不要仅因菜式是粉面就笼统称为面条。'
+              '例如螺蛳粉可能出现米粉、酸笋、腐竹、花生或木耳，但这些配料也可能出现在其他菜中；'
+              '不要凭一个配料或这个例子强行认定菜名。无法区分时给出至多两个可能的备选菜名并说明不确定之处。'
+              '只返回 JSON 对象：name 为最可能的整餐名称，components 为食物明细数组，最多 12 项；'
+              '每项含 name（简体中文）、grams（克）、calories（千卡）、carbs、protein、fat（后三者单位均为克）。'
+              '按整份食物估算重量及营养，数值须为非负数字；不要编造看不见的配料。'
+              'alternatives 为备选菜名字符串数组，没有备选时为空数组；uncertainty_note 为简短的不确定提示，确定时为空字符串。'
+              '格式示意：{"name":"菜名","components":[],"alternatives":[],"uncertainty_note":""}；'
+              '请根据实际照片填写明细，不要照抄示意内容，不要添加 Markdown。')
+    if hint:
+        prompt += '\n用户提供的菜名或配料说明，仅供辨认参考：' + json.dumps(hint,ensure_ascii=False)
     data_url = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes(image)).decode()
     body = {'model': model, 'messages': [{'role': 'user', 'content': [
         {'type': 'text', 'text': prompt}, {'type': 'image_url', 'image_url': {'url': data_url}}]}],
         'response_format': {'type':'json_object'}}
-    body['max_completion_tokens' if provider == 'openai' else 'max_tokens'] = 1500
     req = Request(endpoints[provider], data=json.dumps(body, ensure_ascii=False).encode(), method='POST',
                   headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     try:
-        text = provider_response(req, provider)['choices'][0]['message']['content']
+        choice = provider_response(req, provider)['choices'][0]
+        if choice.get('finish_reason') == 'length': raise ValueError('模型输出未完成，请重试或补充食物说明')
+        text = choice['message']['content']
+        if not isinstance(text,str) or not text.strip(): raise ValueError('模型没有返回可用结果，请重试或补充食物说明')
         parsed = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
         if not isinstance(parsed,dict): raise ValueError('识别结果格式有误')
         result = {'name': str(parsed.get('name', '')).strip()[:80]}
@@ -209,6 +219,15 @@ def vision_recognize(image, provider, key, model):
             raise ValueError('识别结果缺少食物名称')
         note=parsed.get('uncertainty_note')
         if isinstance(note,str) and note.strip(): result['uncertainty_note']=note.strip()[:300]
+        alternatives=parsed.get('alternatives',[])
+        if isinstance(alternatives,list):
+            names=[]
+            for item in alternatives[:6]:
+                if not isinstance(item,str): continue
+                name=item.strip()[:80]
+                if name and name!=result['name'] and name not in names: names.append(name)
+                if len(names)==2: break
+            if names: result['alternatives']=names
         fields=('grams','calories','carbs','protein','fat')
         items=parsed.get('components',parsed.get('items',[]))
         if not isinstance(items,list) or len(items)>12: raise ValueError('识别的食物明细格式有误')
@@ -246,5 +265,5 @@ def vision_recognize(image, provider, key, model):
         if provider == 'openai' and os.environ.get('FOOD_OPENAI_TUNNEL_PORT'):
             raise ValueError('OpenAI 桥接暂不可用，请检查台式机是否开机联网') from exc
         raise ValueError('无法连接识别服务，请检查网络后重试') from exc
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
         raise ValueError('识别结果无法读取，请重试或手动填写') from exc

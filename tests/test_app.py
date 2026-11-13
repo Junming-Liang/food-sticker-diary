@@ -220,6 +220,63 @@ class DiaryTest(unittest.TestCase):
         finally:
             application._photo_lock.release()
 
+    def test_cloud_recognition_and_sticker_run_together(self):
+        import ai,threading
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key'})
+        sticker_started=threading.Event();vision_started=threading.Event()
+        def sticker(image):
+            sticker_started.set()
+            if not vision_started.wait(timeout=3): raise AssertionError('recognition did not start while sticker was running')
+            return b'png-result'
+        def vision(image,provider,key,model):
+            if not sticker_started.wait(timeout=3): raise AssertionError('sticker did not start while recognition was running')
+            vision_started.set()
+            return {'name':'测试','grams':100,'calories':100,'carbs':10,'protein':5,'fat':2}
+        image=io.BytesIO();Image.new('RGB',(20,20),(120,60,30)).save(image,'JPEG');image.seek(0)
+        with patch.object(ai,'sticker',side_effect=sticker),patch.object(ai,'vision_recognize',side_effect=vision):
+            response=self.alice.post('/api/analyze',data={'image':(image,'meal.jpg')},content_type='multipart/form-data')
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json['estimate']['name'],'测试')
+        self.assertEqual(response.json['sticker'],'data:image/png;base64,'+base64.b64encode(b'png-result').decode())
+
+    def test_cloud_recognition_and_sticker_fail_independently(self):
+        import ai
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key'})
+        def post():
+            image=io.BytesIO();Image.new('RGB',(20,20),(120,60,30)).save(image,'JPEG');image.seek(0)
+            return self.alice.post('/api/analyze',data={'image':(image,'meal.jpg')},content_type='multipart/form-data')
+        estimate={'name':'测试','grams':100,'calories':100,'carbs':10,'protein':5,'fat':2}
+        with patch.object(ai,'sticker',side_effect=ValueError('missing')),patch.object(ai,'vision_recognize',return_value=estimate):
+            response=post()
+        self.assertEqual(response.json['estimate'],estimate)
+        self.assertIsNone(response.json['sticker']);self.assertIn('sticker_error',response.json)
+        with patch.object(ai,'sticker',return_value=b'png-result'),patch.object(ai,'vision_recognize',side_effect=ValueError('测试识别错误')):
+            response=post()
+        self.assertTrue(response.json['sticker'].startswith('data:image/png;base64,'))
+        self.assertEqual(response.json['recognition_error'],'测试识别错误')
+
+    def test_concurrent_cloud_photo_jobs_remain_bounded(self):
+        import ai,threading
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key'})
+        second=application.app.test_client()
+        second.set_cookie('food_session',self.alice.get_cookie('food_session').value)
+        entered=threading.Event();release=threading.Event();outcome=[]
+        def vision(*args):
+            entered.set()
+            if not release.wait(timeout=5): raise RuntimeError('test timed out')
+            return {'name':'测试','grams':100,'calories':100,'carbs':10,'protein':5,'fat':2}
+        def post(client):
+            image=io.BytesIO();Image.new('RGB',(20,20)).save(image,'JPEG');image.seek(0)
+            return client.post('/api/analyze',data={'image':(image,'meal.jpg')},content_type='multipart/form-data')
+        with patch.object(ai,'sticker',return_value=b'png-result'),patch.object(ai,'vision_recognize',side_effect=vision):
+            worker=threading.Thread(target=lambda:outcome.append(post(self.alice).status_code));worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=3))
+                self.assertEqual(post(second).status_code,429)
+            finally:
+                release.set();worker.join(timeout=5)
+        self.assertFalse(worker.is_alive());self.assertEqual(outcome,[200])
+
     def test_account_deletion_unbinds_buddy(self):
         token=self.alice.post('/api/buddy/invites',json={}).json['token']
         self.bob.post('/api/buddy/accept',json={'token':token})
@@ -278,6 +335,45 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(len(result['components']),2)
         self.assertEqual(result['uncertainty_note'],'做法需要确认')
 
+    def test_deepseek_request_handles_candidates_and_incomplete_answers(self):
+        import ai,json
+        content={'name':'米粉汤','components':[{'name':'米粉','grams':200,'calories':220}],
+                 'alternatives':['螺蛳粉','螺蛳粉',None,'酸辣粉'],'uncertainty_note':'汤底需要确认'}
+        response={'choices':[{'finish_reason':'stop','message':{'content':json.dumps(content,ensure_ascii=False)}}]}
+        with patch.object(ai,'provider_response',return_value=response) as provider:
+            result=ai.vision_recognize(Image.new('RGB',(20,20)),'deepseek','test-key','deepseek-flash',hint='这是螺蛳粉')
+            payload=json.loads(provider.call_args.args[0].data)
+        self.assertEqual(result['alternatives'],['螺蛳粉','酸辣粉'])
+        self.assertNotIn('max_tokens',payload)
+        self.assertNotIn('max_completion_tokens',payload)
+        self.assertIn('螺蛳粉',payload['messages'][0]['content'][0]['text'])
+        self.assertIn('这是螺蛳粉',payload['messages'][0]['content'][0]['text'])
+        for choice,message in [({'finish_reason':'length','message':{'content':None}},'未完成'),
+                               ({'finish_reason':'stop','message':{'content':'   '}},'没有返回可用结果')]:
+            with patch.object(ai,'provider_response',return_value={'choices':[choice]}):
+                with self.assertRaisesRegex(ValueError,message):
+                    ai.vision_recognize(Image.new('RGB',(20,20)),'deepseek','test-key','deepseek-flash')
+        with patch.object(ai,'provider_response') as provider:
+            with self.assertRaisesRegex(ValueError,'不支持图片'):
+                ai.vision_recognize(Image.new('RGB',(20,20)),'deepseek','test-key','deepseek-v4-pro')
+            provider.assert_not_called()
+
+    def test_reanalysis_uses_user_hint_without_regenerating_sticker(self):
+        import ai
+        self.assertEqual(self.visitor.post('/api/reanalyze').status_code,401)
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key'})
+        def request(hint):
+            image=io.BytesIO();Image.new('RGB',(20,20)).save(image,'JPEG');image.seek(0)
+            return self.alice.post('/api/reanalyze',data={'hint':hint,'image':(image,'meal.jpg')},content_type='multipart/form-data')
+        self.assertEqual(request('').status_code,400)
+        self.assertEqual(request('x'*121).status_code,400)
+        estimate={'name':'螺蛳粉','grams':250,'calories':300,'carbs':40,'protein':8,'fat':10}
+        with patch.object(ai,'vision_recognize',return_value=estimate) as vision,patch.object(ai,'sticker') as sticker:
+            response=request('螺蛳粉，配菜有酸笋和腐竹')
+        self.assertEqual(response.status_code,200);self.assertEqual(response.json['estimate'],estimate)
+        self.assertEqual(vision.call_args.kwargs['hint'],'螺蛳粉，配菜有酸笋和腐竹')
+        self.assertNotIn('test-key',str(response.json));sticker.assert_not_called()
+
     def test_openai_request_and_model_access_error(self):
         import ai,json
         from urllib.error import HTTPError
@@ -286,7 +382,7 @@ class DiaryTest(unittest.TestCase):
             ai.vision_recognize(Image.new('RGB',(20,20)),'openai','test-key','gpt-6.1-terra')
             payload=json.loads(provider.call_args.args[0].data)
         self.assertEqual(payload['model'],'gpt-6.1-terra')
-        self.assertEqual(payload['max_completion_tokens'],1500)
+        self.assertNotIn('max_completion_tokens',payload)
         self.assertNotIn('max_tokens',payload)
         error=HTTPError('https://api.openai.com/v1/chat/completions',404,'not found',{},io.BytesIO(b'{"error":{"code":"model_not_found"}}'))
         with patch.object(ai,'provider_response',side_effect=error):

@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -380,26 +381,63 @@ def analyze_photo():
     # Every photo is reencoded before any storage or external provider request, stripping metadata.
     photo = ai.jpeg_bytes(image)
     result = {'photo':'data:image/jpeg;base64,' + base64.b64encode(photo).decode(), 'sticker':None}
-    try:
-        result['sticker'] = 'data:image/png;base64,' + base64.b64encode(ai.sticker(image)).decode()
-    except (FileNotFoundError, ValueError, RuntimeError):
-        result['sticker_error'] = '贴纸暂时无法生成，仍可保存原照片'
     provider = g.user['provider']
-    try:
-        if provider in ('openai','deepseek'):
-            if not g.user['api_key']: raise ValueError('请先在「我的」中配置 API 密钥')
-            key = cipher.decrypt(g.user['api_key'].encode()).decode()
-            result['estimate'] = ai.vision_recognize(image, provider, key, g.user['model'])
-            result['source'] = provider
-        else:
-            result['candidates'] = ai.local_recognize(image)
-            result['source'] = 'local'
-    except FileNotFoundError:
-        result['recognition_error'] = '本地识别模型尚未安装，可配置 AI 服务或手动填写'
-    except Exception as exc:
-        app.logger.warning('Photo recognition failed: %s', type(exc).__name__)
-        result['recognition_error'] = str(exc) if isinstance(exc, ValueError) else '识别失败，请检查服务配置后重试'
+    def collect_sticker(get_result):
+        try:
+            result['sticker'] = 'data:image/png;base64,' + base64.b64encode(get_result()).decode()
+        except (FileNotFoundError, ValueError, RuntimeError):
+            result['sticker_error'] = '贴纸暂时无法生成，仍可保存原照片'
+    def collect_recognition():
+        try:
+            if provider in ('openai','deepseek'):
+                if not g.user['api_key']: raise ValueError('请先在「我的」中配置 API 密钥')
+                key = cipher.decrypt(g.user['api_key'].encode()).decode()
+                result['estimate'] = ai.vision_recognize(image, provider, key, g.user['model'])
+                result['source'] = provider
+            else:
+                result['candidates'] = ai.local_recognize(image)
+                result['source'] = 'local'
+        except FileNotFoundError:
+            result['recognition_error'] = '本地识别模型尚未安装，可配置 AI 服务或手动填写'
+        except Exception as exc:
+            app.logger.warning('Photo recognition failed: %s', type(exc).__name__)
+            result['recognition_error'] = str(exc) if isinstance(exc, ValueError) else '识别失败，请检查服务配置后重试'
+    if provider in ('openai','deepseek'):
+        # minimal: the outer photo lock still allows only one job on the shared server.
+        with ThreadPoolExecutor(max_workers=1,thread_name_prefix='food-sticker') as pool:
+            sticker = pool.submit(ai.sticker,image.copy())
+            collect_recognition()
+            collect_sticker(sticker.result)
+    else:
+        collect_sticker(lambda:ai.sticker(image))
+        collect_recognition()
     return jsonify(result)
+
+
+@app.post('/api/reanalyze')
+@auth
+def reanalyze():
+    if not _photo_lock.acquire(blocking=False):
+        return jsonify(error='当前正在处理另一张照片，请稍后重试'),429
+    try:
+        provider=g.user['provider']
+        if provider not in ('openai','deepseek') or not g.user['api_key']:
+            return jsonify(error='请先在「我的」中配置视觉识别服务'),400
+        hint=request.form.get('hint','').strip()
+        if not 1<=len(hint)<=120 or any(ord(c)<32 for c in hint):
+            return jsonify(error='请输入 1 至 120 个字的菜名或配料说明'),400
+        try:
+            image=clean_image(request.files.get('image'))
+            key=cipher.decrypt(g.user['api_key'].encode()).decode()
+            estimate=ai.vision_recognize(image,provider,key,g.user['model'],hint=hint)
+            return jsonify(estimate=estimate,source=provider)
+        except ValueError as exc:
+            return jsonify(error=str(exc)),400
+        except Exception as exc:
+            app.logger.warning('Photo recognition retry failed: %s',type(exc).__name__)
+            return jsonify(error='识别失败，请检查服务配置后重试'),502
+    finally:
+        _photo_lock.release()
 
 
 def meal_fields(data):
