@@ -108,6 +108,55 @@ class DiaryTest(unittest.TestCase):
         self.alice.delete(f'/api/meals/{mid}')
         self.assertFalse(original.exists());self.assertFalse(thumb.exists())
 
+    def test_sticker_border_editing_preserves_source_and_shares_the_result(self):
+        image=Image.new('RGBA',(80,60),(19,51,94,0));image.paste((220,70,20,255),(20,20,60,40))
+        stream=io.BytesIO();image.save(stream,format='PNG')
+        payload={'day':'2026-11-13','category':'lunch','name':'测试','calories':100,
+                 'sticker':'data:image/png;base64,'+base64.b64encode(stream.getvalue()).decode()}
+        mid=self.alice.post('/api/meals',json=payload).json['meal']['id']
+        with application.app.app_context():
+            row=application.db().execute('SELECT user_id,sticker FROM meals WHERE id=?',(mid,)).fetchone()
+            source=application.UPLOADS/str(row['user_id'])/row['sticker']
+            original=source.read_bytes()
+        self.assertEqual(self.bob.put(f'/api/meals/{mid}/sticker-style',json={'border':2,'color':'#ff0000'}).status_code,404)
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}/sticker-style',json={'border':3,'color':'#ff0000'}).status_code,400)
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}/sticker-style',json={'border':1,'color':'red'}).status_code,400)
+        response=self.alice.put(f'/api/meals/{mid}/sticker-style',json={'border':2,'color':'#ff0000'})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json['meal']['sticker_border'],2)
+        self.assertEqual(response.json['meal']['sticker_color'],'#ff0000')
+        styled=self.alice.get(f'/api/meals/{mid}/sticker')
+        picture=Image.open(io.BytesIO(styled.data)).convert('RGBA')
+        self.assertEqual(picture.size,(82,62))
+        self.assertEqual(picture.getpixel((20,31)),(255,0,0,255));styled.close()
+        self.assertEqual(source.read_bytes(),original)
+        response=self.alice.get(f'/api/meals/{mid}/sticker-source')
+        self.assertEqual(Image.open(io.BytesIO(response.data)).size,(80,60));response.close()
+        token=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]['token']
+        shared=self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker')
+        self.assertEqual(Image.open(io.BytesIO(shared.data)).convert('RGBA').getpixel((20,31)),(255,0,0,255));shared.close()
+        self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker-source').status_code,404)
+        with application.app.app_context():
+            variant=application.UPLOADS/str(row['user_id'])/application.db().execute('SELECT sticker_rendered FROM meals WHERE id=?',(mid,)).fetchone()['sticker_rendered']
+        self.assertTrue(variant.exists())
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}/sticker-style',json={'border':0,'color':'#ffffff'}).status_code,200)
+        self.assertFalse(variant.exists())
+        self.assertEqual(source.read_bytes(),original)
+        self.assertEqual(self.alice.put(f'/api/meals/{mid}/sticker-style',json={'border':1,'color':'#00ff00'}).status_code,200)
+        with application.app.app_context():
+            variant=application.UPLOADS/str(row['user_id'])/application.db().execute('SELECT sticker_rendered FROM meals WHERE id=?',(mid,)).fetchone()['sticker_rendered']
+        self.assertTrue(variant.exists())
+        self.alice.delete(f'/api/meals/{mid}')
+        self.assertFalse(source.exists());self.assertFalse(variant.exists());self.assertFalse(variant.with_name(variant.name+'.thumb').exists())
+
+    def test_fast_sticker_outline_matches_square_max_filter(self):
+        import ai,numpy as np
+        from PIL import ImageFilter
+        random=np.random.default_rng(42).integers(0,256,(18,24),dtype=np.uint8)
+        alpha=Image.fromarray(np.pad(random,3))
+        expected=np.asarray(alpha.filter(ImageFilter.MaxFilter(7)))
+        self.assertTrue(np.array_equal(np.asarray(ai.expand_alpha(alpha,3)),expected))
+
     def test_macronutrient_goals_are_optional_and_persist(self):
         response=self.alice.put('/api/settings',json={'target':1900,'carbs_goal':200,'protein_goal':95.5,'fat_goal':''})
         self.assertEqual(response.status_code,200)
@@ -195,6 +244,7 @@ class DiaryTest(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
             self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
+            self.assertEqual(conn.execute("SELECT sticker_border,sticker_color,sticker_rendered FROM meals WHERE id='old'").fetchone(),(0,'#ffffff',None))
             self.assertEqual(conn.execute("SELECT username,target,carbs_goal,protein_goal,fat_goal FROM users WHERE id=1").fetchone(),('legacy',1900,None,None,None))
             self.assertEqual(conn.execute("SELECT provider,model,api_key FROM provider_settings WHERE user_id=2").fetchone(),('deepseek','old-model','encrypted-old-key'))
             conn.close()

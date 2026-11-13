@@ -90,7 +90,8 @@ def initialize():
             day TEXT NOT NULL, category TEXT NOT NULL, name TEXT NOT NULL,
             grams REAL NOT NULL, calories REAL NOT NULL, carbs REAL NOT NULL, protein REAL NOT NULL, fat REAL NOT NULL,
             image TEXT, sticker TEXT, created INTEGER NOT NULL,
-            components TEXT NOT NULL DEFAULT '[]'
+            components TEXT NOT NULL DEFAULT '[]', sticker_rendered TEXT,
+            sticker_border INTEGER NOT NULL DEFAULT 0, sticker_color TEXT NOT NULL DEFAULT '#ffffff'
         );
         CREATE INDEX IF NOT EXISTS meals_user_day ON meals(user_id,day);
         CREATE TABLE IF NOT EXISTS shares (
@@ -133,6 +134,9 @@ def initialize():
         columns={row['name'] for row in db().execute('PRAGMA table_info(meals)').fetchall()}
         if 'components' not in columns:
             db().execute("ALTER TABLE meals ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
+        for name,definition in (('sticker_rendered','TEXT'),('sticker_border','INTEGER NOT NULL DEFAULT 0'),
+                                ('sticker_color',"TEXT NOT NULL DEFAULT '#ffffff'")):
+            if name not in columns: db().execute(f'ALTER TABLE meals ADD COLUMN {name} {definition}')
         user_columns={row['name'] for row in db().execute('PRAGMA table_info(users)').fetchall()}
         for name in ('carbs_goal','protein_goal','fat_goal'):
             if name not in user_columns:
@@ -500,6 +504,7 @@ def remove_image(user_id, name):
 def meal_json(row, shared=False):
     return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created')} | {
         'has_photo':bool(row['image']) and not shared, 'has_sticker':bool(row['sticker']),
+        'sticker_border':row['sticker_border'], 'sticker_color':row['sticker_color'],
         'components':json.loads(row['components'])}
 
 
@@ -562,28 +567,72 @@ def delete_meal(mid):
     row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
     if not row: abort(404)
     db().execute('DELETE FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])); db().commit()
-    remove_image(g.user['id'],row['image']); remove_image(g.user['id'],row['sticker'])
+    remove_image(g.user['id'],row['image']); remove_image(g.user['id'],row['sticker']); remove_image(g.user['id'],row['sticker_rendered'])
     return jsonify(ok=True)
 
 
+@app.put('/api/meals/<mid>/sticker-style')
+@auth
+@serialized_images
+def update_sticker_style(mid):
+    row=db().execute('SELECT * FROM meals WHERE id=? AND user_id=?',(mid,g.user['id'])).fetchone()
+    if not row or not row['sticker']: abort(404)
+    data=body(); border=data.get('border'); color=data.get('color')
+    if type(border) is not int or border not in (0,1,2) or not isinstance(color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',color):
+        return jsonify(error='请选择有效的贴纸边框和颜色'),400
+    color=color.lower(); new_name=None
+    if not _photo_lock.acquire(blocking=False): return jsonify(error='当前正在处理另一张照片，请稍后重试'),429
+    try:
+        if border:
+            source=UPLOADS / str(g.user['id']) / Path(row['sticker']).name
+            if not source.is_file(): abort(404)
+            if shutil.disk_usage(DATA).free < 2 * 1024**3: return jsonify(error='服务器存储空间不足，暂时无法保存贴纸'),400
+            with Image.open(source) as image:
+                image=ai.sanitize_sticker(image)
+                radius=max(1,min(16,round(max(image.size)*(.006 if border==1 else .012))))
+                size=(image.width+2*radius,image.height+2*radius)
+                alpha=Image.new('L',size,0);alpha.paste(image.getchannel('A'),(radius,radius))
+                outline=ai.expand_alpha(alpha,radius)
+                rgb=tuple(int(color[i:i+2],16) for i in (1,3,5))
+                rendered=Image.new('RGBA',size,(*rgb,0));rendered.putalpha(outline);rendered.alpha_composite(image,(radius,radius))
+            new_name=secrets.token_hex(16)+'.png'
+            path=UPLOADS / str(g.user['id']) / new_name
+            rendered.save(path,format='PNG');os.chmod(path,0o600)
+            try: publish_thumbnail(path,thumbnail_bytes(rendered,'sticker'))
+            except OSError: app.logger.warning('Could not cache an image preview')
+        db().execute('UPDATE meals SET sticker_rendered=?,sticker_border=?,sticker_color=? WHERE id=? AND user_id=?',
+                     (new_name,border,color,mid,g.user['id']));db().commit()
+    except (OSError,ValueError):
+        remove_image(g.user['id'],new_name)
+        return jsonify(error='无法保存贴纸，请稍后重试'),400
+    except Exception:
+        remove_image(g.user['id'],new_name)
+        raise
+    finally:
+        _photo_lock.release()
+    remove_image(g.user['id'],row['sticker_rendered'])
+    updated=db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()
+    return jsonify(meal=meal_json(updated))
+
+
 def send_meal_image(row, kind):
-    name = row['sticker'] if kind=='sticker' else row['image'] if kind=='photo' else None
+    name = (row['sticker_rendered'] or row['sticker']) if kind=='sticker' else row['sticker'] if kind=='sticker-source' else row['image'] if kind=='photo' else None
     if not name: abort(404)
     path = UPLOADS / str(row['user_id']) / Path(name).name
     if not path.is_file(): abort(404)
     if request.args.get('size') == 'thumbnail':
         target = path.with_name(path.name + '.thumb')
-        mimetype = 'image/png' if kind == 'sticker' else 'image/jpeg'
+        mimetype = 'image/png' if kind in ('sticker','sticker-source') else 'image/jpeg'
         try:
             if not target.is_file():
                 with Image.open(path) as image:
-                    content = thumbnail_bytes(image, kind)
+                    content = thumbnail_bytes(image, 'sticker' if kind=='sticker-source' else kind)
                 try: target = publish_thumbnail(path, content)
                 except OSError: target = None
                 if target is None: return send_file(io.BytesIO(content), mimetype=mimetype, conditional=False)
             return send_file(target, mimetype=mimetype, conditional=False)
         except (OSError, ValueError): abort(404)
-    if kind == 'sticker':
+    if kind in ('sticker','sticker-source'):
         # Sanitize on output as well, so legacy files remain unchanged on disk.
         try:
             with Image.open(path) as image:

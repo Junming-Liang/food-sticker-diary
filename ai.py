@@ -78,6 +78,19 @@ def sanitize_sticker(image):
     return Image.fromarray(pixels)
 
 
+def expand_alpha(alpha, radius):
+    """Expand a mask with a square maximum filter, using two linear passes."""
+    pixels=np.asarray(alpha,dtype=np.uint8)
+    horizontal=np.zeros_like(pixels); result=np.zeros_like(pixels)
+    for offset in range(-radius,radius+1):
+        dst,src=(slice(None,-offset),slice(offset,None)) if offset>0 else (slice(-offset,None),slice(None,offset)) if offset<0 else (slice(None),slice(None))
+        np.maximum(horizontal[:,dst],pixels[:,src],out=horizontal[:,dst])
+    for offset in range(-radius,radius+1):
+        dst,src=(slice(None,-offset),slice(offset,None)) if offset>0 else (slice(-offset,None),slice(None,offset)) if offset<0 else (slice(None),slice(None))
+        np.maximum(result[dst,:],horizontal[src,:],out=result[dst,:])
+    return Image.fromarray(result)
+
+
 def sticker(image):
     """U2NetP produces a subject alpha matte; return a transparent PNG."""
     with _lock:
