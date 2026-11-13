@@ -62,7 +62,7 @@ def initialize():
             id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password TEXT NOT NULL, target INTEGER NOT NULL DEFAULT 1800,
             provider TEXT NOT NULL DEFAULT 'local', model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
-            created INTEGER NOT NULL
+            created INTEGER NOT NULL, carbs_goal REAL, protein_goal REAL, fat_goal REAL
         );
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -116,6 +116,10 @@ def initialize():
         columns={row['name'] for row in db().execute('PRAGMA table_info(meals)').fetchall()}
         if 'components' not in columns:
             db().execute("ALTER TABLE meals ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
+        user_columns={row['name'] for row in db().execute('PRAGMA table_info(users)').fetchall()}
+        for name in ('carbs_goal','protein_goal','fat_goal'):
+            if name not in user_columns:
+                db().execute(f'ALTER TABLE users ADD COLUMN {name} REAL')
         db().commit()
 
 
@@ -173,7 +177,8 @@ def valid_day(value):
 
 def public_user(user):
     return {'id':user['id'], 'username':user['username'], 'target':user['target'],
-            'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key'])}
+            'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key']),
+            'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal']}
 
 
 def issue_session(user):
@@ -262,19 +267,28 @@ def settings():
     data = body(); provider = data.get('provider', g.user['provider'])
     if provider not in ('local', 'openai', 'deepseek'): return jsonify(error='请选择有效的识别服务'), 400
     defaults = {'openai':'gpt-4o-mini', 'deepseek':'deepseek-flash', 'local':''}
-    model = str(data.get('model', '')).strip()[:100] or defaults[provider]
+    model = str(data.get('model', g.user['model'] if provider == g.user['provider'] else '')).strip()[:100] or defaults[provider]
     if model and not re.fullmatch(r'[\w.\-:]+', model): return jsonify(error='模型名称格式不正确'), 400
     try: target = int(data.get('target', g.user['target']))
     except (TypeError, ValueError): return jsonify(error='请输入有效的每日目标'), 400
     if not 500 <= target <= 10000: return jsonify(error='每日目标需在 500 至 10000 千卡之间'), 400
+    goals=[]
+    for name in ('carbs_goal','protein_goal','fat_goal'):
+        value=data.get(name,g.user[name])
+        if value in ('',None): goals.append(None); continue
+        try: value=float(value)
+        except (TypeError,ValueError): return jsonify(error='请输入有效的营养目标'),400
+        if not 0.1 <= value <= 2000: return jsonify(error='营养目标需在 0.1 至 2000 克之间'),400
+        goals.append(round(value,1))
     raw_key = str(data.get('api_key', '')).strip()
     if len(raw_key)>512 or any(ord(c)<32 for c in raw_key): return jsonify(error='API 密钥格式不正确'), 400
     # A credential belongs to one provider: switching providers never reuses another provider's key.
     saved_key = g.user['api_key'] if provider == g.user['provider'] else ''
     if data.get('clear_key'): saved_key = ''
     elif raw_key: saved_key = cipher.encrypt(raw_key.encode()).decode()
-    db().execute('UPDATE users SET provider=?,model=?,api_key=?,target=? WHERE id=?',
-                 (provider,model,saved_key,target,g.user['id'])); db().commit()
+    db().execute('''UPDATE users SET provider=?,model=?,api_key=?,target=?,
+                 carbs_goal=?,protein_goal=?,fat_goal=? WHERE id=?''',
+                 (provider,model,saved_key,target,*goals,g.user['id'])); db().commit()
     user = db().execute('SELECT * FROM users WHERE id=?', (g.user['id'],)).fetchone()
     return jsonify(user=public_user(user))
 

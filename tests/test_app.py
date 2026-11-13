@@ -48,6 +48,19 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.visitor.get(f'/api/shared/{token}').status_code,404)
         self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker').status_code,404)
 
+    def test_macronutrient_goals_are_optional_and_persist(self):
+        response=self.alice.put('/api/settings',json={'target':1900,'carbs_goal':200,'protein_goal':95.5,'fat_goal':''})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json['user']['carbs_goal'],200)
+        self.assertEqual(response.json['user']['protein_goal'],95.5)
+        self.assertIsNone(response.json['user']['fat_goal'])
+        response=self.alice.put('/api/settings',json={'provider':'deepseek','model':'deepseek-flash-custom','target':1850})
+        self.assertEqual(response.json['user']['carbs_goal'],200)
+        response=self.alice.put('/api/settings',json={'target':1800})
+        self.assertEqual(response.json['user']['model'],'deepseek-flash-custom')
+        self.assertEqual(self.alice.put('/api/settings',json={'carbs_goal':0.04}).status_code,400)
+        self.assertIsNone(self.bob.get('/api/me').json['user']['carbs_goal'])
+
     def test_settings_encrypted_and_origin_rejected(self):
         resp=self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-secret-value','model':'deepseek-flash','target':1900})
         self.assertEqual(resp.status_code,200)
@@ -92,6 +105,9 @@ class DiaryTest(unittest.TestCase):
         import sqlite3,subprocess,sys
         with tempfile.TemporaryDirectory(prefix='food-diary-migration-') as directory:
             conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
+            conn.execute("""CREATE TABLE users (id INTEGER PRIMARY KEY,username TEXT UNIQUE,password TEXT,target INTEGER,
+                         provider TEXT,model TEXT,api_key TEXT,created INTEGER)""")
+            conn.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?)",(1,'legacy','hash',1900,'local','','',1))
             conn.execute("""CREATE TABLE meals (id TEXT PRIMARY KEY,user_id INTEGER,day TEXT,category TEXT,name TEXT,
                          grams REAL,calories REAL,carbs REAL,protein REAL,fat REAL,image TEXT,sticker TEXT,created INTEGER)""")
             conn.execute("INSERT INTO meals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",('old',1,'2026-11-13','lunch','旧记录',100,123,1,2,3,None,None,1))
@@ -101,6 +117,7 @@ class DiaryTest(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
             self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
+            self.assertEqual(conn.execute("SELECT username,target,carbs_goal,protein_goal,fat_goal FROM users WHERE id=1").fetchone(),('legacy',1900,None,None,None))
             conn.close()
 
     def test_meal_components_are_persisted_and_totals_are_authoritative(self):
