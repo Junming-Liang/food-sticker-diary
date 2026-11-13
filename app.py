@@ -80,6 +80,11 @@ def initialize():
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             expires INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_settings (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL CHECK(provider IN ('openai','deepseek')),
+            model TEXT NOT NULL, api_key TEXT NOT NULL, PRIMARY KEY(user_id,provider)
+        );
         CREATE TABLE IF NOT EXISTS meals (
             id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, category TEXT NOT NULL, name TEXT NOT NULL,
@@ -132,6 +137,8 @@ def initialize():
         for name in ('carbs_goal','protein_goal','fat_goal'):
             if name not in user_columns:
                 db().execute(f'ALTER TABLE users ADD COLUMN {name} REAL')
+        db().execute('''INSERT OR IGNORE INTO provider_settings(user_id,provider,model,api_key)
+                     SELECT id,provider,model,api_key FROM users WHERE provider IN ('openai','deepseek')''')
         db().commit()
 
 
@@ -188,8 +195,11 @@ def valid_day(value):
 
 
 def public_user(user):
+    options={row['provider']:{'model':row['model'],'has_key':bool(row['api_key'])}
+             for row in db().execute('SELECT provider,model,api_key FROM provider_settings WHERE user_id=?',(user['id'],))}
     return {'id':user['id'], 'username':user['username'], 'target':user['target'],
             'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key']),
+            'provider_options':options,
             'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal']}
 
 
@@ -277,17 +287,24 @@ def delete_account():
 @app.put('/api/settings')
 @auth
 def settings():
-    data = body(); provider = data.get('provider', g.user['provider'])
+    data = body()
+    db().execute('BEGIN IMMEDIATE')
+    current = db().execute('SELECT * FROM users WHERE id=?',(g.user['id'],)).fetchone()
+    if not current: abort(401)
+    provider = data.get('provider', current['provider'])
     if provider not in ('local', 'openai', 'deepseek'): return jsonify(error='请选择有效的识别服务'), 400
     defaults = {'openai':'gpt-4o-mini', 'deepseek':'deepseek-flash', 'local':''}
-    model = str(data.get('model', g.user['model'] if provider == g.user['provider'] else '')).strip()[:100] or defaults[provider]
+    previous = db().execute('SELECT model,api_key FROM provider_settings WHERE user_id=? AND provider=?',
+                            (g.user['id'],provider)).fetchone()
+    previous_model = current['model'] if provider == current['provider'] else previous['model'] if previous else ''
+    model = str(data.get('model', previous_model)).strip()[:100] or defaults[provider]
     if model and not re.fullmatch(r'[\w.\-:]+', model): return jsonify(error='模型名称格式不正确'), 400
-    try: target = int(data.get('target', g.user['target']))
+    try: target = int(data.get('target', current['target']))
     except (TypeError, ValueError): return jsonify(error='请输入有效的每日目标'), 400
     if not 500 <= target <= 10000: return jsonify(error='每日目标需在 500 至 10000 千卡之间'), 400
     goals=[]
     for name in ('carbs_goal','protein_goal','fat_goal'):
-        value=data.get(name,g.user[name])
+        value=data.get(name,current[name])
         if value in ('',None): goals.append(None); continue
         try: value=float(value)
         except (TypeError,ValueError): return jsonify(error='请输入有效的营养目标'),400
@@ -295,10 +312,15 @@ def settings():
         goals.append(round(value,1))
     raw_key = str(data.get('api_key', '')).strip()
     if len(raw_key)>512 or any(ord(c)<32 for c in raw_key): return jsonify(error='API 密钥格式不正确'), 400
-    # A credential belongs to one provider: switching providers never reuses another provider's key.
-    saved_key = g.user['api_key'] if provider == g.user['provider'] else ''
+    # Each service keeps its own encrypted key; never send one service another service's key.
+    saved_key = current['api_key'] if provider == current['provider'] else previous['api_key'] if previous else ''
+    if provider == 'local': saved_key = ''
     if data.get('clear_key'): saved_key = ''
-    elif raw_key: saved_key = cipher.encrypt(raw_key.encode()).decode()
+    elif raw_key and provider != 'local': saved_key = cipher.encrypt(raw_key.encode()).decode()
+    if provider != 'local':
+        db().execute('''INSERT INTO provider_settings(user_id,provider,model,api_key) VALUES(?,?,?,?)
+                      ON CONFLICT(user_id,provider) DO UPDATE SET model=excluded.model,api_key=excluded.api_key''',
+                     (g.user['id'],provider,model,saved_key))
     db().execute('''UPDATE users SET provider=?,model=?,api_key=?,target=?,
                  carbs_goal=?,protein_goal=?,fat_goal=? WHERE id=?''',
                  (provider,model,saved_key,target,*goals,g.user['id'])); db().commit()

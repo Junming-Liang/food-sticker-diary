@@ -130,6 +130,20 @@ class DiaryTest(unittest.TestCase):
             self.assertNotIn('test-secret-value',row['api_key'])
         resp=self.alice.put('/api/settings',json={'provider':'openai','target':1900})
         self.assertFalse(resp.json['user']['has_key'])
+        self.assertTrue(resp.json['user']['provider_options']['deepseek']['has_key'])
+        resp=self.alice.put('/api/settings',json={'provider':'deepseek'})
+        self.assertTrue(resp.json['user']['has_key'])
+        self.assertEqual(resp.json['user']['model'],'deepseek-flash')
+        self.alice.put('/api/settings',json={'provider':'openai','model':'gpt-6.1-terra','api_key':'openai-test-key'})
+        resp=self.alice.put('/api/settings',json={'provider':'deepseek'})
+        self.assertTrue(resp.json['user']['has_key'])
+        resp=self.alice.put('/api/settings',json={'provider':'openai'})
+        self.assertTrue(resp.json['user']['has_key'])
+        self.assertEqual(resp.json['user']['model'],'gpt-6.1-terra')
+        self.assertNotIn('test-key',str(resp.json))
+        self.alice.put('/api/settings',json={'provider':'openai','clear_key':True})
+        self.assertTrue(self.alice.put('/api/settings',json={'provider':'deepseek'}).json['user']['has_key'])
+        self.assertFalse(self.alice.put('/api/settings',json={'provider':'openai'}).json['user']['has_key'])
         self.assertEqual(self.alice.post('/api/shares',json={'day':'2026-11-13'},headers={'Origin':'https://bad.example'}).status_code,403)
 
     def test_validation_and_update(self):
@@ -171,6 +185,7 @@ class DiaryTest(unittest.TestCase):
             conn.execute("""CREATE TABLE users (id INTEGER PRIMARY KEY,username TEXT UNIQUE,password TEXT,target INTEGER,
                          provider TEXT,model TEXT,api_key TEXT,created INTEGER)""")
             conn.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?)",(1,'legacy','hash',1900,'local','','',1))
+            conn.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?)",(2,'legacy-cloud','hash',1800,'deepseek','old-model','encrypted-old-key',1))
             conn.execute("""CREATE TABLE meals (id TEXT PRIMARY KEY,user_id INTEGER,day TEXT,category TEXT,name TEXT,
                          grams REAL,calories REAL,carbs REAL,protein REAL,fat REAL,image TEXT,sticker TEXT,created INTEGER)""")
             conn.execute("INSERT INTO meals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",('old',1,'2026-11-13','lunch','旧记录',100,123,1,2,3,None,None,1))
@@ -181,6 +196,7 @@ class DiaryTest(unittest.TestCase):
             conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
             self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
             self.assertEqual(conn.execute("SELECT username,target,carbs_goal,protein_goal,fat_goal FROM users WHERE id=1").fetchone(),('legacy',1900,None,None,None))
+            self.assertEqual(conn.execute("SELECT provider,model,api_key FROM provider_settings WHERE user_id=2").fetchone(),('deepseek','old-model','encrypted-old-key'))
             conn.close()
 
     def test_meal_components_are_persisted_and_totals_are_authoritative(self):
