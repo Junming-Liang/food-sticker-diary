@@ -54,6 +54,9 @@ def session(name):
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
         opts.inter_op_num_threads = 1
+        # Release temporary inference buffers between photos on the shared server.
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
         _sessions[name] = ort.InferenceSession(str(path), sess_options=opts, providers=['CPUExecutionProvider'])
     return _sessions[name]
 

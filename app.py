@@ -8,6 +8,7 @@ import secrets
 import shutil
 import sqlite3
 import time
+import threading
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -78,10 +79,27 @@ def initialize():
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS buddy_pairs (
+            id TEXT PRIMARY KEY, created INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS buddy_members (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            pair_id TEXT NOT NULL REFERENCES buddy_pairs(id) ON DELETE CASCADE,
+            sharing INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS buddy_invites (
+            token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            expires INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS water (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY(user_id, day)
         );
+        CREATE TABLE IF NOT EXISTS fasts (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            started INTEGER NOT NULL, ended INTEGER, goal_hours INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS fasts_one_active ON fasts(user_id) WHERE ended IS NULL;
         CREATE TABLE IF NOT EXISTS weights (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY(user_id, day)
@@ -131,7 +149,9 @@ def auth(f):
     return wrapped
 
 
-def body(): return request.get_json(silent=True) or {}
+def body():
+    value = request.get_json(silent=True)
+    return value if isinstance(value, dict) else {}
 
 
 def valid_day(value):
@@ -219,6 +239,7 @@ def delete_account():
     # Remove the image files before deleting the account so an I/O error remains retryable.
     folder = UPLOADS / str(user_id)
     if folder.is_dir(): shutil.rmtree(folder)
+    db().execute('DELETE FROM buddy_pairs WHERE id IN (SELECT pair_id FROM buddy_members WHERE user_id=?)', (user_id,))
     db().execute('DELETE FROM users WHERE id=?', (user_id,)); db().commit()
     response = jsonify(ok=True); response.delete_cookie('food_session', path=BASE)
     return response
@@ -252,7 +273,7 @@ def clean_image(file):
     try:
         Image.MAX_IMAGE_PIXELS = 24_000_000
         image = Image.open(file)
-        if image.width * image.height > 24_000_000:
+        if image.width * image.height > 8_000_000:
             raise ValueError('照片尺寸过大，请选择较小的图片')
         if image.format not in ('JPEG','PNG','WEBP'):
             raise ValueError('请选择 JPG、PNG 或 WebP 照片')
@@ -263,9 +284,22 @@ def clean_image(file):
         raise ValueError('无法读取照片，请换一张图片') from exc
 
 
+# minimal: a single photo job bounds memory on the shared server; a busy user can retry.
+_photo_lock = threading.BoundedSemaphore(1)
+
+
 @app.post('/api/analyze')
 @auth
 def analyze():
+    if not _photo_lock.acquire(blocking=False):
+        return jsonify(error='当前正在处理另一张照片，请稍后重试'), 429
+    try:
+        return analyze_photo()
+    finally:
+        _photo_lock.release()
+
+
+def analyze_photo():
     try: image = clean_image(request.files.get('image'))
     except ValueError as exc: return jsonify(error=str(exc)), 400
     # Every photo is reencoded before any storage or external provider request, stripping metadata.
@@ -411,6 +445,110 @@ def meal_image(mid,kind):
     return send_meal_image(row,kind)
 
 
+def own_buddy():
+    return db().execute('SELECT * FROM buddy_members WHERE user_id=?', (g.user['id'],)).fetchone()
+
+
+@app.get('/api/buddy')
+@auth
+def buddy():
+    own = own_buddy()
+    if not own: return jsonify(paired=False)
+    other = db().execute('''SELECT buddy_members.*, users.username, users.target FROM buddy_members
+        JOIN users ON users.id=buddy_members.user_id WHERE pair_id=? AND user_id<>?''',
+        (own['pair_id'],g.user['id'])).fetchone()
+    if not other: return jsonify(paired=False)
+    day=request.args.get('day','')
+    if not valid_day(day): return jsonify(error='请选择有效的日期'),400
+    result = {'paired':True, 'username':other['username'], 'sharing':bool(own['sharing']),
+              'other_sharing':bool(other['sharing']), 'target':other['target'] if other['sharing'] else None, 'meals':[]}
+    if other['sharing']:
+        rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
+                            (other['user_id'],day)).fetchall()
+        result['meals'] = [meal_json(row) for row in rows]
+    return jsonify(result)
+
+
+@app.post('/api/buddy/invites')
+@auth
+def create_buddy_invite():
+    if own_buddy(): return jsonify(error='请先解除当前搭子关系'),409
+    token = secrets.token_urlsafe(32); now = int(time.time())
+    db().execute('DELETE FROM buddy_invites WHERE user_id=? OR expires<?',(g.user['id'],now))
+    db().execute('INSERT INTO buddy_invites VALUES (?,?,?)',(digest(token),g.user['id'],now+86400)); db().commit()
+    return jsonify(token=token,expires=now+86400)
+
+
+@app.get('/api/buddy/invites/<token>')
+@auth
+def inspect_buddy_invite(token):
+    if len(token)>100: abort(404)
+    row=db().execute('''SELECT users.username,users.id FROM buddy_invites JOIN users ON users.id=buddy_invites.user_id
+        WHERE token_hash=? AND expires>?''',(digest(token),int(time.time()))).fetchone()
+    if not row: return jsonify(error='邀请链接无效或已过期'),404
+    if row['id']==g.user['id']: return jsonify(error='不能接受自己的邀请'),400
+    if own_buddy(): return jsonify(error='请先解除当前搭子关系'),409
+    return jsonify(username=row['username'])
+
+
+@app.post('/api/buddy/accept')
+@auth
+def accept_buddy():
+    token=str(body().get('token',''))
+    if len(token)>100: return jsonify(error='邀请链接无效或已过期'),404
+    try:
+        db().execute('BEGIN IMMEDIATE')
+        invite=db().execute('SELECT * FROM buddy_invites WHERE token_hash=? AND expires>?',
+                            (digest(token),int(time.time()))).fetchone()
+        if not invite:
+            db().rollback(); return jsonify(error='邀请链接无效或已过期'),404
+        owner=invite['user_id']
+        if owner==g.user['id']:
+            db().rollback(); return jsonify(error='不能接受自己的邀请'),400
+        if db().execute('SELECT 1 FROM buddy_members WHERE user_id IN (?,?)', (owner,g.user['id'])).fetchone():
+            db().rollback(); return jsonify(error='你或对方已有搭子，请先解除现有关系'),409
+        pair=secrets.token_hex(16)
+        db().execute('INSERT INTO buddy_pairs VALUES (?,?)',(pair,int(time.time())))
+        db().executemany('INSERT INTO buddy_members(user_id,pair_id,sharing) VALUES (?,?,1)',
+                         [(owner,pair),(g.user['id'],pair)])
+        db().execute('DELETE FROM buddy_invites WHERE user_id IN (?,?)',(owner,g.user['id']))
+        db().commit()
+    except sqlite3.IntegrityError:
+        db().rollback(); return jsonify(error='搭子关系已变更，请重新邀请'),409
+    return jsonify(ok=True)
+
+
+@app.put('/api/buddy/sharing')
+@auth
+def buddy_sharing():
+    enabled=body().get('enabled')
+    if not isinstance(enabled,bool): return jsonify(error='请选择共享状态'),400
+    if not own_buddy(): return jsonify(error='还没有绑定搭子'),404
+    db().execute('UPDATE buddy_members SET sharing=? WHERE user_id=?',(int(enabled),g.user['id'])); db().commit()
+    return jsonify(ok=True)
+
+
+@app.delete('/api/buddy')
+@auth
+def delete_buddy():
+    own=own_buddy()
+    if own:
+        db().execute('DELETE FROM buddy_pairs WHERE id=?',(own['pair_id'],)); db().commit()
+    return jsonify(ok=True)
+
+
+@app.get('/api/buddy/meals/<mid>/<kind>')
+@auth
+def buddy_image(mid,kind):
+    own=own_buddy()
+    if not own: abort(404)
+    row=db().execute('''SELECT meals.* FROM meals JOIN buddy_members ON buddy_members.user_id=meals.user_id
+       WHERE meals.id=? AND buddy_members.pair_id=? AND buddy_members.user_id<>? AND buddy_members.sharing=1''',
+       (mid,own['pair_id'],g.user['id'])).fetchone()
+    if not row: abort(404)
+    return send_meal_image(row,kind)
+
+
 @app.route('/api/water', methods=['GET','PUT'])
 @auth
 def water():
@@ -425,6 +563,42 @@ def water():
                      (g.user['id'],day,amount)); db().commit()
     row = db().execute('SELECT amount FROM water WHERE user_id=? AND day=?',(g.user['id'],day)).fetchone()
     return jsonify(amount=row['amount'] if row else 0)
+
+
+@app.route('/api/fasts', methods=['GET','POST'])
+@auth
+def fasts():
+    if request.method=='POST':
+        try: hours=int(body().get('goal_hours',0))
+        except (ValueError,TypeError): return jsonify(error='请选择有效的计时时长'),400
+        if hours not in (12,14,16,18): return jsonify(error='请选择有效的计时时长'),400
+        try:
+            db().execute('INSERT INTO fasts VALUES (?,?,?,?,?)',
+                         (secrets.token_hex(16),g.user['id'],int(time.time()),None,hours)); db().commit()
+        except sqlite3.IntegrityError:
+            db().rollback(); return jsonify(error='已有进行中的计时，请先结束'),409
+    rows=db().execute('SELECT id,started,ended,goal_hours FROM fasts WHERE user_id=? ORDER BY started DESC LIMIT 60',
+                      (g.user['id'],)).fetchall()
+    return jsonify(fasts=[dict(row) for row in rows])
+
+
+@app.post('/api/fasts/end')
+@auth
+def end_fast():
+    result=db().execute('UPDATE fasts SET ended=MAX(?,started) WHERE user_id=? AND ended IS NULL',
+                        (int(time.time()),g.user['id']))
+    db().commit()
+    if not result.rowcount: return jsonify(error='没有进行中的计时'),404
+    return jsonify(ok=True)
+
+
+@app.delete('/api/fasts/<fid>')
+@auth
+def delete_fast(fid):
+    result=db().execute('DELETE FROM fasts WHERE id=? AND user_id=? AND ended IS NOT NULL',(fid,g.user['id']))
+    db().commit()
+    if not result.rowcount: return jsonify(error='记录不存在'),404
+    return jsonify(ok=True)
 
 
 @app.route('/api/weights', methods=['GET','POST'])

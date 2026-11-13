@@ -64,6 +64,56 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.put('/api/water',json={'day':'2026-11-13','amount':500}).json['amount'],500)
         self.assertEqual(self.alice.post('/api/weights',json={'day':'2026-11-13','weight':62.5}).json['weights'][0]['weight'],62.5)
 
+    def test_photo_jobs_are_bounded(self):
+        application._photo_lock.acquire()
+        try:
+            response=self.alice.post('/api/analyze',data={})
+            self.assertEqual(response.status_code,429)
+        finally:
+            application._photo_lock.release()
+
+    def test_account_deletion_unbinds_buddy(self):
+        token=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':token})
+        self.assertTrue(self.bob.get('/api/buddy?day=2026-11-13').json['paired'])
+        self.assertEqual(self.alice.delete('/api/account',json={'password':'long-password'}).status_code,200)
+        self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['paired'])
+
+    def test_fasting_timer_is_private_and_records_actual_end(self):
+        self.assertEqual(self.alice.post('/api/fasts',json={'goal_hours':16}).status_code,200)
+        self.assertEqual(self.alice.post('/api/fasts',json={'goal_hours':16}).status_code,409)
+        active=self.alice.get('/api/fasts').json['fasts'][0]
+        self.assertIsNone(active['ended'])
+        self.assertEqual(self.bob.get('/api/fasts').json['fasts'],[])
+        self.assertEqual(self.bob.post('/api/fasts/end',json={}).status_code,404)
+        self.assertEqual(self.alice.delete(f"/api/fasts/{active['id']}").status_code,404)
+        self.assertEqual(self.alice.post('/api/fasts/end',json={}).status_code,200)
+        finished=self.alice.get('/api/fasts').json['fasts'][0]
+        self.assertGreaterEqual(finished['ended'],finished['started'])
+        self.assertEqual(self.alice.delete(f"/api/fasts/{active['id']}").status_code,200)
+
+    def test_buddy_sharing_requires_consent_and_can_be_paused(self):
+        payload={'day':'2026-11-13','category':'lunch','name':'测试餐','calories':180,'photo':photo_data()}
+        mid=self.alice.post('/api/meals',json=payload).json['meal']['id']
+        token=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.assertEqual(self.alice.post('/api/buddy/accept',json={'token':token}).status_code,400)
+        self.assertEqual(self.bob.get(f'/api/buddy/invites/{token}').status_code,200)
+        self.assertEqual(self.bob.post('/api/buddy/accept',json={'token':token}).status_code,200)
+        self.assertEqual(self.bob.get(f'/api/buddy/invites/{token}').status_code,404)
+        result=self.bob.get('/api/buddy?day=2026-11-13').json
+        self.assertEqual(result['meals'][0]['id'],mid)
+        image_response=self.bob.get(f'/api/buddy/meals/{mid}/photo')
+        self.assertEqual(image_response.status_code,200); image_response.close()
+        self.assertEqual(self.visitor.get(f'/api/buddy/meals/{mid}/photo').status_code,401)
+        self.alice.put('/api/buddy/sharing',json={'enabled':False})
+        self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['other_sharing'])
+        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/photo').status_code,404)
+        self.alice.put('/api/buddy/sharing',json={'enabled':True})
+        self.assertEqual(len(self.bob.get('/api/buddy?day=2026-11-13').json['meals']),1)
+        self.bob.delete('/api/buddy')
+        self.assertFalse(self.alice.get('/api/buddy?day=2026-11-13').json['paired'])
+        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/photo').status_code,404)
+
     def test_delete_account_revokes_shares_and_data(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
         self.assertEqual(self.alice.post('/api/meals',json=meal).status_code,201)
