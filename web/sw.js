@@ -1,4 +1,4 @@
-const CACHE = 'food-diary-shell-v13';
+const CACHE = 'food-diary-shell-v14';
 const SHELL = ['./', './style.css', './app.js', './foods.json', './icon.svg', './icon-192.png', './icon-512.png', './manifest.webmanifest'];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith('food-diary-shell-') && k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));

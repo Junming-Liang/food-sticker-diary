@@ -26,4 +26,17 @@
 .record-actions{display:flex;align-items:center;gap:4px}
 .food-thumb:not([src]){background:#e8e8e3;border-radius:10px}
 
+.scan-visual{height:min(34dvh,240px);min-height:170px;border-radius:16px;position:relative;overflow:hidden;background:#e9ded4}
+.scan-visual img{width:100%;height:100%;display:block;object-fit:cover}
+.scan-shade{position:absolute;inset:0;background:linear-gradient(180deg,#160e0a20 0%,transparent 44%,#160e0a80 100%)}
+.scan-frame{position:absolute;inset:16px;border:1px solid #fffc;border-radius:12px}
+.scan-beam{position:absolute;left:17px;right:17px;top:20%;height:2px;background:#fff;box-shadow:0 0 16px 5px #fff9;animation:scan-beam 2.6s ease-in-out infinite alternate}
+.scan-badge{position:absolute;left:28px;bottom:28px;display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:20px;background:#24211dd9;color:#fff;font-size:12px;font-weight:650}
+.scan-badge .icon{width:15px;height:15px;color:#ffbea9}
+.scan-copy{text-align:center;margin:20px 0 18px}.scan-copy h3{font-size:18px;line-height:26px;margin:0 0 5px}.scan-copy p{font-size:13px;line-height:20px;color:#686862;margin:0}
+.scan-steps{display:flex;align-items:center;justify-content:center;gap:10px}.scan-step{display:flex;align-items:center;gap:6px;color:#85857e;font-size:12px;font-weight:600;white-space:nowrap}.scan-step-icon{height:24px;width:24px;display:grid;place-items:center;border-radius:50%;background:#e8e8e2;color:#777770;font-size:11px}.scan-connector{width:28px;height:1px;background:#d8d8d1}
+.scan-steps[data-stage="prepare"] .scan-step:first-child,.scan-steps[data-stage="analyze"] .scan-step{color:#3c3934}.scan-steps[data-stage="prepare"] .scan-step:first-child .scan-step-icon,.scan-steps[data-stage="analyze"] .scan-step:last-child .scan-step-icon{background:#f33e22;color:#fff}.scan-steps[data-stage="analyze"] .scan-step:first-child .scan-step-icon{background:#dff0df;color:#288b39}
+.scan-hint{text-align:center;color:#777770;font-size:12px;line-height:20px;margin:18px 0 0}
+@keyframes scan-beam{from{transform:translateY(0)}to{transform:translateY(min(23dvh,155px))}}
+
 .weight-chart{display:block;width:100%;height:120px;margin-top:12px}.chart-dates{display:flex;justify-content:space-between;color:#686862;font-size:12px;line-height:16px}

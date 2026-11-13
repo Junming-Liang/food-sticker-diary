@@ -110,10 +110,24 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     });
     const detected=[{name:'米饭',grams:100,calories:130,carbs:28,protein:3,fat:0.3},
                     {name:'鸡蛋',grams:50,calories:78,carbs:0.5,protein:6,fat:5}];
-    await owner.route('**/api/analyze',route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
+    await owner.route('**/api/analyze',async route => {await new Promise(resolve=>setTimeout(resolve,800));await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
       source:'deepseek',photo:photo.jpeg,sticker:photo.png,
       estimate:{name:'一份餐食',grams:150,calories:208,carbs:28.5,protein:9,fat:5.3,components:detected}
-    })}));
+    })})});
+    await owner.getByRole('button',{name:'添加饮食记录'}).click();
+    await owner.getByRole('button',{name:/从相册选择/}).click();
+    await owner.locator('#gallery-input').setInputFiles({name:'meal.jpg',mimeType:'image/jpeg',buffer:Buffer.from(photo.jpeg.split(',')[1],'base64')});
+    await owner.getByRole('heading',{name:'正在识别'}).waitFor();
+    await owner.getByRole('img',{name:'正在识别的食物照片'}).waitFor();
+    await owner.getByText('正在生成贴纸并分析食物…').waitFor();
+    assert.equal(await owner.locator('#scan-steps').getAttribute('data-stage'),'analyze');
+    assert.equal(await owner.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+    const scanUrl=await owner.getByRole('img',{name:'正在识别的食物照片'}).getAttribute('src');
+    await owner.getByRole('button',{name:'关闭'}).click();
+    const scanRevoked=await owner.evaluate(url=>new Promise(resolve=>{const img=new Image();img.onload=()=>resolve(false);img.onerror=()=>resolve(true);img.src=url}),scanUrl);
+    assert.equal(scanRevoked,true);
+    await owner.waitForTimeout(1000);
+    assert.equal(await owner.locator('dialog[open]').count(),0);
     await owner.getByRole('button',{name:'添加饮食记录'}).click();
     await owner.getByRole('button',{name:/从相册选择/}).click();
     await owner.locator('#gallery-input').setInputFiles({name:'meal.jpg',mimeType:'image/jpeg',buffer:Buffer.from(photo.jpeg.split(',')[1],'base64')});

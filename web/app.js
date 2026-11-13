@@ -9,7 +9,7 @@ function shiftDay(day, amount){const d=new Date(`${day}T12:00:00`);d.setDate(d.g
 function dateLabel(day){const d=new Date(`${day}T12:00:00`);return `${d.getMonth()+1}月${d.getDate()}日`}
 const cats=[['breakfast','早餐','sun'],['lunch','午餐','spark'],['dinner','晚餐','sticker'],['snack','加餐','plus']];
 const state={user:null,view:'today',day:today(),meals:[],exercises:[],water:0,layout:'list',category:'breakfast',image:null,shares:[],weights:[],weekly:[],fasts:[],foods:[],foodRef:null,nutritionEdited:false,shareToken:new URL(location.href).searchParams.get('share'),shared:null,buddy:null,buddyToken:new URL(location.href).searchParams.get('invite'),scanVersion:0};
-let toastTimer;
+let toastTimer,scanPreviewUrl=null;
 const loaded={meals:null,water:null,exercises:null,weekly:null,weights:false,fasts:false,buddy:null};
 let loadVersion=0, mutationVersion=0;
 const pictureCache=new Map(),pictureRequests=new Map(),pictureObservers={};
@@ -79,7 +79,8 @@ async function api(path, opts={}){
 function toast(text){const el=$('#toast');el.textContent=text;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),3200)}
 function formError(form,message){const el=$('.form-error',form);if(el){el.textContent=message;el.classList.add('visible')}else toast(message)}
 function openSheet(content){sheet.className='dialog';sheet.innerHTML=`<div class="sheet-inner">${content}</div>`;if(!sheet.open)sheet.showModal();hydratePictures(sheet)}
-function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();state.scanVersion++}
+function closeSheet(){if(sheet.open)sheet.close();pictureObservers.sheet?.disconnect();if(scanPreviewUrl){URL.revokeObjectURL(scanPreviewUrl);scanPreviewUrl=null}state.scanVersion++}
+sheet.addEventListener('cancel',event=>{event.preventDefault();closeSheet()});
 function sheetTop(title){return `<div class="sheet-top"><h2 id="sheet-title">${esc(title)}</h2><button class="icon-button" type="button" data-action="close" aria-label="关闭">${icon('close')}</button></div>`}
 function round(n){return Math.round(Number(n)||0)}
 function total(meals,key){return meals.reduce((sum,item)=>sum+Number(item[key]||0),0)}
@@ -269,11 +270,17 @@ function shareSheet(){const links=state.shares.map(s=>`<div class="share-item"><
  openSheet(`${sheetTop('分享管理')}<p class="sheet-description">链接可查看对应日期的餐食和贴纸，原照片不会分享。自动抠图可能保留部分背景，请先查看贴纸。链接 7 天后自动失效，也可随时撤销。</p><button class="button full" data-action="create-share">${icon('share')}生成 ${dateLabel(state.day)} 的分享链接</button><div style="margin-top:16px">${links||'<p class="panel-note">还没有有效的分享链接。</p>'}</div>`)}
 function weightSheet(){openSheet(`${sheetTop('体重记录')}<form id="weight-form"><div class="form-grid"><label class="field"><span>日期</span><input type="date" name="day" value="${state.day}" required></label><label class="field"><span>体重 · 千克</span><input type="number" name="weight" min="10" max="500" step="0.1" required placeholder="例如 60.5"></label></div><p class="form-error" role="alert"></p><button class="button full" type="submit">保存体重</button></form><div style="margin-top:16px">${state.weights.map(w=>`<div class="share-item"><div>${esc(w.day)}<small>${w.weight} 千克</small></div><button class="text-button danger" data-action="confirm-delete-weight" data-day="${esc(w.day)}">删除</button></div>`).join('')||'<p class="panel-note">还没有体重记录。</p>'}</div>`)}
 async function preparePhoto(file){
- if(!file)return;const version=++state.scanVersion;openSheet(`${sheetTop('正在识别')}<div class="skeleton picture"></div><div class="skeleton line"></div><div class="skeleton line short"></div><p class="panel-note">正在生成贴纸和分析食物，通常需要一点时间。</p>`);
+ if(!file)return;const version=++state.scanVersion;
+ if(scanPreviewUrl)URL.revokeObjectURL(scanPreviewUrl);
+ const previewUrl=URL.createObjectURL(file);scanPreviewUrl=previewUrl;
+ openSheet(`${sheetTop('正在识别')}<div class="scan-visual"><img src="${previewUrl}" alt="正在识别的食物照片"><div class="scan-shade"></div><div class="scan-frame"></div><div class="scan-beam"></div><div class="scan-badge">${icon('spark')}<span>食物识别中</span></div></div><div class="scan-copy"><h3>正在认识你的这一餐</h3><p id="scan-status" role="status" aria-live="polite">正在准备照片…</p></div><div class="scan-steps" id="scan-steps" data-stage="prepare"><div class="scan-step"><span class="scan-step-icon">1</span><span>准备照片</span></div><span class="scan-connector"></span><div class="scan-step"><span class="scan-step-icon">2</span><span>生成贴纸与分析</span></div></div><p class="scan-hint">识别时间取决于图片、网络和所选模型，请稍候。</p>`);
  try{
-  const blob=await new Promise((resolve,reject)=>{const image=new Image();const url=URL.createObjectURL(file);image.onload=()=>{const canvas=document.createElement('canvas');const scale=Math.min(1,1280/Math.max(image.width,image.height));canvas.width=Math.max(1,Math.round(image.width*scale));canvas.height=Math.max(1,Math.round(image.height*scale));canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height);URL.revokeObjectURL(url);canvas.toBlob(b=>b?resolve(b):reject(new Error('无法读取照片')),'image/jpeg',.88)};image.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('无法读取照片，请换一张图片'))};image.src=url});
+  const blob=await new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>{const canvas=document.createElement('canvas');const scale=Math.min(1,1280/Math.max(image.width,image.height));canvas.width=Math.max(1,Math.round(image.width*scale));canvas.height=Math.max(1,Math.round(image.height*scale));canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height);canvas.toBlob(b=>b?resolve(b):reject(new Error('无法读取照片')),'image/jpeg',.88)};image.onerror=()=>reject(new Error('无法读取照片，请换一张图片'));image.src=previewUrl});
+  if(version!==state.scanVersion)return;
+  $('#scan-steps',sheet).dataset.stage='analyze';$('#scan-status',sheet).textContent='正在生成贴纸并分析食物…';
   const form=new FormData();form.append('image',blob,'food.jpg');const analysis=await api('analyze',{method:'POST',body:form});if(version!==state.scanVersion)return;if(analysis.source==='local'&&analysis.candidates?.length){try{await loadFoods();const food=state.foods.find(f=>f.id===localFoodRefs[analysis.candidates[0].name]);if(food){state.foodRef=food;state.nutritionEdited=false;analysis.estimate=foodEstimate(food);analysis.local_reference=true}}catch{}}if(version!==state.scanVersion)return;state.image=analysis;mealForm(null,analysis);
  }catch(e){if(version!==state.scanVersion)return;openSheet(`${sheetTop('识别未完成')}<p class="sheet-description">${esc(e.message)}</p><button class="button full" data-action="manual">手动记录</button>`)}
+ finally{if(scanPreviewUrl===previewUrl){URL.revokeObjectURL(previewUrl);scanPreviewUrl=null}}
 }
 async function showBuddyInvite(){
  if(!state.buddyToken||!state.user)return;
