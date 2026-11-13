@@ -64,6 +64,14 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.put('/api/water',json={'day':'2026-11-13','amount':500}).json['amount'],500)
         self.assertEqual(self.alice.post('/api/weights',json={'day':'2026-11-13','weight':62.5}).json['weights'][0]['weight'],62.5)
 
+    def test_photo_save_keeps_disk_reserve(self):
+        from types import SimpleNamespace
+        data={'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
+        with patch.object(application.shutil,'disk_usage',return_value=SimpleNamespace(free=100)):
+            response=self.alice.post('/api/meals',json=data)
+        self.assertEqual(response.status_code,400)
+        self.assertEqual(self.alice.get('/api/meals?day=2026-11-13').json['meals'],[])
+
     def test_photo_jobs_are_bounded(self):
         application._photo_lock.acquire()
         try:

@@ -343,6 +343,9 @@ def meal_fields(data):
 
 def save_image(data_url, user_id, kind):
     if not data_url: return None
+    # Leave room for the other services that share this filesystem.
+    if shutil.disk_usage(DATA).free < 2 * 1024**3:
+        raise ValueError('服务器存储空间不足，暂时无法保存照片')
     expected = 'data:image/jpeg;base64,' if kind == 'photo' else 'data:image/png;base64,'
     if not isinstance(data_url,str) or not data_url.startswith(expected) or len(data_url) > 10_000_000:
         raise ValueError('图片格式不正确')

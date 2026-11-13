@@ -6,6 +6,7 @@
 
 - 手机端每日热量环、三餐和加餐、贴纸墙、七日趋势。
 - 食物照片自动抠图；识别结果、餐次、重量和营养均可手动修改。贴纸可下载为透明 PNG。
+- 内置常见食物库，可搜索食材并按重量估算热量与营养；手动修改后的数值不会被重量变化覆盖。
 - 支持在个人设置中配置 DeepSeek 或 OpenAI 的视觉模型与 API 密钥。食物照片会发送到选定服务商，可能产生 API 费用。
 - 没有 API 密钥时可使用本地 Food-101 模型给出菜品候选；这个模型主要覆盖 101 类常见西式菜品，**不估算热量或重量**，需要手动填写。中餐、混合餐和看不清的照片可能识别错误。
 - 独立账号、饮水、体重和断食计时记录。
@@ -17,7 +18,7 @@
 
 ## 运行
 
-需要 Python 3.10 或更高版本以及约 100 MB 的模型空间。
+已在 Python 3.12、3.13 上验证；本地模型需要约 100 MB 空间。
 
 ```bash
 git clone https://github.com/Junming-Liang/food-sticker-diary.git
@@ -31,7 +32,19 @@ FOOD_BASE=/ FOOD_COOKIE_SECURE=0 waitress-serve --listen=127.0.0.1:8792 app:app
 
 本地打开 `http://127.0.0.1:8792/`。模型下载器会校验 SHA-256；如果模型不可用，仍可手动记录或配置云端视觉服务，但自动抠图需要 U2NetP 模型。
 
+手机上可使用 Safari 的“分享 → 添加到主屏幕”，或 Android 浏览器的安装选项将应用加入桌面。PWA 仍需要网络访问个人数据和识别服务。
+
 `FOOD_COOKIE_SECURE=0` 仅用于本地 HTTP。生产环境应启用 HTTPS，并使用默认的安全 Cookie。设置 `FOOD_BASE` 为对外路径，例如 `/food-diary/`；代理需剥离该路径前缀。`deploy/` 包含 systemd 和 Nginx 示例。若修改对外路径，请同步修改服务环境变量与代理配置。
+
+## 食物库数据
+
+内置食物库由 [USDA FoodData Central SR Legacy 2018](https://fdc.nal.usda.gov/download-datasets/) 中的常见食材整理，数值以每 100 克为基准，并提供每条原始数据链接。中文名称保留生熟及烹调条件；请选取与实际食物接近的条目。相同食物的品种、含水量、调味和烹饪用油可能导致明显差异，混合菜应结合具体配料调整。份量默认为 100 克，需要按实际情况修改。
+
+食物数据可从 USDA 的 SR Legacy CSV 压缩包重建：
+
+```bash
+python scripts/build_foods.py /path/to/FoodData_Central_sr_legacy_food_csv_2018-04.zip
+```
 
 ## 配置视觉识别
 
@@ -57,7 +70,7 @@ python -m unittest discover -s tests -v
 
 ## 模型和许可证
 
-项目代码使用 MIT 许可证。模型权重不包含在仓库中，请分别查看上游许可证：
+项目代码使用 MIT 许可证。内置食物数据来源于 [USDA FoodData Central](https://fdc.nal.usda.gov/api-guide/)，原始数据属于公共领域。模型权重不包含在仓库中，请分别查看上游许可证：
 
 - [Food-101 Swin ONNX](https://huggingface.co/onnx-community/swin-finetuned-food101-ONNX)，Apache-2.0。
 - [U²-Net](https://github.com/xuebinqin/U-2-Net)，Apache-2.0；本项目下载 [rembg 发布的 U2NetP ONNX 权重](https://github.com/danielgatis/rembg)。

@@ -8,7 +8,7 @@ function localDate(d){ return `${d.getFullYear()}-${String(d.getMonth()+1).padSt
 function shiftDay(day, amount){const d=new Date(`${day}T12:00:00`);d.setDate(d.getDate()+amount);return localDate(d)}
 function dateLabel(day){const d=new Date(`${day}T12:00:00`);return `${d.getMonth()+1}月${d.getDate()}日`}
 const cats=[['breakfast','早餐','sun'],['lunch','午餐','spark'],['dinner','晚餐','sticker'],['snack','加餐','plus']];
-const state={user:null,view:'today',day:today(),meals:[],water:0,layout:'list',category:'breakfast',image:null,shares:[],weights:[],weekly:[],fasts:[],shareToken:new URL(location.href).searchParams.get('share'),shared:null,buddy:null,buddyToken:new URL(location.href).searchParams.get('invite'),scanVersion:0};
+const state={user:null,view:'today',day:today(),meals:[],water:0,layout:'list',category:'breakfast',image:null,shares:[],weights:[],weekly:[],fasts:[],foods:[],foodRef:null,nutritionEdited:false,shareToken:new URL(location.href).searchParams.get('share'),shared:null,buddy:null,buddyToken:new URL(location.href).searchParams.get('invite'),scanVersion:0};
 let toastTimer;
 
 async function api(path, opts={}){
@@ -100,15 +100,24 @@ async function loadView(){
  if(state.view==='fasting')state.fasts=(await api('fasts')).fasts;
  render();
 }
-function addSheet(category){state.category=category||'breakfast';openSheet(`${sheetTop('记录一餐')}<p class="sheet-description">拍下眼前的食物，或直接填写你吃了什么。</p><button class="quick-option" data-action="camera"><span class="icon-wrap">${icon('camera')}</span><span><strong>拍照识别</strong><small>拍一张照片，生成食物贴纸</small></span></button><button class="quick-option" data-action="gallery"><span class="icon-wrap">${icon('image')}</span><span><strong>从相册选择</strong><small>上传已有的食物照片</small></span></button><button class="quick-option" data-action="manual"><span class="icon-wrap">${icon('plus')}</span><span><strong>手动记录</strong><small>自己填写食物和营养信息</small></span></button>`)}
+function addSheet(category){state.category=category||'breakfast';openSheet(`${sheetTop('记录一餐')}<p class="sheet-description">拍下眼前的食物，或直接填写你吃了什么。</p><button class="quick-option" data-action="camera"><span class="icon-wrap">${icon('camera')}</span><span><strong>拍照识别</strong><small>拍一张照片，生成食物贴纸</small></span></button><button class="quick-option" data-action="gallery"><span class="icon-wrap">${icon('image')}</span><span><strong>从相册选择</strong><small>上传已有的食物照片</small></span></button><button class="quick-option" data-action="food-library"><span class="icon-wrap">${icon('list')}</span><span><strong>食物库</strong><small>搜索常见食材，按重量估算营养</small></span></button><button class="quick-option" data-action="manual"><span class="icon-wrap">${icon('plus')}</span><span><strong>手动记录</strong><small>自己填写食物和营养信息</small></span></button>`)}
 function numberField(name,label,value='',required=false){return `<label class="field"><span>${label}</span><input name="${name}" type="number" min="0" max="100000" step="0.1" inputmode="decimal" placeholder="0" value="${esc(value)}" ${required?'required':''}></label>`}
 function mealForm(meal=null,analysis=null){
  const editing=Boolean(meal);const estimate=analysis?.estimate||{};const candidates=analysis?.candidates||[];
  const name=meal?.name||estimate.name||candidates[0]?.name||'';const category=meal?.category||state.category;const image=analysis?.sticker||analysis?.photo;
  const imageMarkup=image?`<div class="preview"><img src="${image}" alt="生成的食物贴纸"></div>`:meal?.has_sticker||meal?.has_photo?`<div class="preview">${pic(meal)}</div>${meal.has_sticker?`<a class="text-button" href="api/meals/${meal.id}/sticker" download="food-sticker.png">保存透明贴纸</a>`:''}`:'';
- const notes=[];if(analysis?.recognition_error)notes.push(analysis.recognition_error);else if(analysis?.source==='local')notes.push('本地模型仅识别部分菜品，热量和营养请自行填写。');else if(analysis?.source)notes.push('AI 识别结果仅为估算，保存前请检查并修改。');if(analysis?.sticker_error)notes.push(analysis.sticker_error);
+ const notes=[];if(analysis?.recognition_error)notes.push(analysis.recognition_error);else if(analysis?.source==='local')notes.push('本地模型仅识别部分菜品，可从食物库选择食材或自行填写营养。');else if(analysis?.source==='catalog')notes.push('已按 100 克及 USDA 食物数据估算，可按实际重量和做法修改。');else if(analysis?.source)notes.push('AI 识别结果仅为估算，保存前请检查并修改。');if(analysis?.sticker_error)notes.push(analysis.sticker_error);
  openSheet(`${sheetTop(editing?'编辑饮食':'确认饮食记录')}${imageMarkup}${notes.length?`<p class="ai-note">${esc(notes.join(' '))}</p>`:''}${candidates.length?`<div class="candidates" aria-label="识别候选">${candidates.map((item,i)=>`<button class="candidate ${i===0?'active':''}" data-action="candidate" data-name="${esc(item.name)}">${esc(item.name)}</button>`).join('')}</div>`:''}
- <form id="meal-form" data-id="${editing?meal.id:''}"><label class="field"><span>食物名称</span><input name="name" maxlength="80" required placeholder="例如：番茄炒蛋" value="${esc(name)}"></label><div class="form-grid"><label class="field"><span>餐次</span><select name="category">${cats.map(([id,label])=>`<option value="${id}" ${category===id?'selected':''}>${label}</option>`).join('')}</select></label><label class="field"><span>日期</span><input type="date" name="day" value="${meal?.day||state.day}" required></label></div><div class="form-grid">${numberField('grams','重量 · 克',meal?.grams??estimate.grams??'')}${numberField('calories','热量 · 千卡',meal?.calories??estimate.calories??'',true)}</div><div class="form-grid three">${numberField('carbs','碳水 · 克',meal?.carbs??estimate.carbs??'')}${numberField('protein','蛋白质 · 克',meal?.protein??estimate.protein??'')}${numberField('fat','脂肪 · 克',meal?.fat??estimate.fat??'')}</div><p class="ai-note">未填写的重量与营养项按 0 记录，可随时修改。</p><p class="form-error" role="alert"></p><div class="sheet-footer">${editing?`<button class="button secondary danger" type="button" data-action="confirm-delete" data-id="${meal.id}">${icon('trash')}删除</button>`:''}<button class="button" type="submit">保存记录</button></div></form>`);
+ <form id="meal-form" data-id="${editing?meal.id:''}"><label class="field"><span>食物名称</span><input name="name" maxlength="80" required placeholder="例如：番茄炒蛋" value="${esc(name)}"></label>${!editing?'<button class="text-button" type="button" data-action="food-library">从食物库选择</button>':''}<div class="form-grid"><label class="field"><span>餐次</span><select name="category">${cats.map(([id,label])=>`<option value="${id}" ${category===id?'selected':''}>${label}</option>`).join('')}</select></label><label class="field"><span>日期</span><input type="date" name="day" value="${meal?.day||state.day}" required></label></div><div class="form-grid">${numberField('grams','重量 · 克',meal?.grams??estimate.grams??'')}${numberField('calories','热量 · 千卡',meal?.calories??estimate.calories??'',true)}</div><div class="form-grid three">${numberField('carbs','碳水 · 克',meal?.carbs??estimate.carbs??'')}${numberField('protein','蛋白质 · 克',meal?.protein??estimate.protein??'')}${numberField('fat','脂肪 · 克',meal?.fat??estimate.fat??'')}</div><p class="ai-note" id="nutrition-note">${state.foodRef?`数据来源：USDA FoodData Central · <a href="https://fdc.nal.usda.gov/food-details/${state.foodRef.id}/nutrients" target="_blank" rel="noopener noreferrer">查看食物原始数据</a>。修改重量时会重新估算。`:'未填写的重量与营养项按 0 记录，可随时修改。'}</p><p class="form-error" role="alert"></p><div class="sheet-footer">${editing?`<button class="button secondary danger" type="button" data-action="confirm-delete" data-id="${meal.id}">${icon('trash')}删除</button>`:''}<button class="button" type="submit">保存记录</button></div></form>`);
+}
+async function foodLibrary(){
+ if(!state.foods.length){const response=await fetch('foods.json');if(!response.ok)throw new Error('食物库暂时无法加载');state.foods=(await response.json()).foods}
+ openSheet(`${sheetTop('食物库')}<p class="sheet-description">搜索常见食材。数值来自 USDA 数据库，做法和份量不同会影响结果。</p><label class="field"><span>搜索食物</span><input id="food-search" type="search" placeholder="例如：米饭、鸡蛋、苹果" autocomplete="off"></label><div id="food-results"></div>`);
+ renderFoodResults('');
+}
+function renderFoodResults(query){
+ const words=query.trim().toLowerCase().split(/\s+/).filter(Boolean);const matches=state.foods.filter(f=>words.every(w=>`${f.name} ${f.keywords} ${f.source_name}`.toLowerCase().includes(w))).slice(0,30);
+ $('#food-results',sheet).innerHTML=matches.length?matches.map(f=>`<button class="food-option" data-action="choose-food" data-id="${f.id}"><span><strong>${esc(f.name)}</strong><small>${round(f.calories)} 千卡 / 100 克</small></span>${icon('chevron')}</button>`).join(''):`<p class="panel-note">没有找到相关食物，可以返回后手动记录。</p>`;
 }
 function settingsSheet(){const u=state.user;openSheet(`${sheetTop('目标与识别设置')}<form id="settings-form"><label class="field"><span>每日热量目标 · 千卡</span><input type="number" name="target" value="${u.target}" min="500" max="10000" required><small>默认目标仅为初始值，请根据自己的情况调整。</small></label><label class="field"><span>照片识别服务</span><select name="provider"><option value="local" ${u.provider==='local'?'selected':''}>本地识别</option><option value="deepseek" ${u.provider==='deepseek'?'selected':''}>DeepSeek</option><option value="openai" ${u.provider==='openai'?'selected':''}>OpenAI</option></select></label><div id="provider-fields" ${u.provider==='local'?'hidden':''}><label class="field"><span>模型名称</span><input name="model" value="${esc(u.model)}" placeholder="输入支持图片的模型名称"><small>DeepSeek 默认 deepseek-flash；OpenAI 默认 gpt-4o-mini。</small></label><label class="field"><span>API 密钥</span><input name="api_key" type="password" autocomplete="off" placeholder="${u.has_key?'已配置；留空保持不变':'输入你的 API 密钥'}"><small>密钥加密保存在服务器，仅用于你选择的服务。更换服务时需要重新填写。识别照片会发送至所选服务商，并可能产生费用。</small></label><label><input type="checkbox" name="clear_key"> <span class="panel-note">清除当前保存的密钥</span></label></div><p class="form-error" role="alert"></p><div class="sheet-footer"><button class="button" type="submit">保存设置</button></div></form>`)}
 function shareSheet(){const links=state.shares.map(s=>`<div class="share-item"><div>${esc(s.day)}<small>有效至 ${new Date(s.expires*1000).toLocaleDateString('zh-CN')}</small></div><button class="text-button" data-action="copy-share" data-token="${esc(s.token)}">复制</button><button class="text-button danger" data-action="revoke" data-id="${s.id}">撤销</button></div>`).join('');
@@ -139,11 +148,13 @@ document.addEventListener('click',async event=>{
   if(action==='date'){state.day=button.dataset.day;await loadView();return}
   if(action==='layout'){state.layout=button.dataset.layout;render();return}
   if(action==='calendar'){openSheet(`${sheetTop('选择日期')}<form id="date-form"><label class="field"><span>查看哪一天</span><input type="date" name="day" value="${state.day}" required></label><button class="button full" type="submit">查看记录</button></form>`);return}
-  if(action==='add'){state.image=null;addSheet(button.dataset.category);return}
-  if(action==='manual'){state.image=null;mealForm();return}
+  if(action==='add'){state.image=null;state.foodRef=null;state.nutritionEdited=false;addSheet(button.dataset.category);return}
+  if(action==='manual'){state.image=null;state.foodRef=null;state.nutritionEdited=false;mealForm();return}
+  if(action==='food-library'){await foodLibrary();return}
+  if(action==='choose-food'){const food=state.foods.find(f=>f.id===button.dataset.id);if(!food)return;state.foodRef=food;state.nutritionEdited=false;const estimate={...food,grams:100};for(const key of ['calories','carbs','protein','fat'])estimate[key]=Math.round(food[key]*10)/10;mealForm(null,{...(state.image||{}),recognition_error:null,source:'catalog',estimate});return}
   if(action==='camera'||action==='gallery'){$(`#${action}-input`).click();return}
   if(action==='candidate'){$('[name="name"]',sheet).value=button.dataset.name;sheet.querySelectorAll('.candidate').forEach(x=>x.classList.toggle('active',x===button));return}
-  if(action==='edit'){const m=state.meals.find(x=>x.id===button.dataset.id);if(m){state.image=null;mealForm(m)}return}
+  if(action==='edit'){const m=state.meals.find(x=>x.id===button.dataset.id);if(m){state.image=null;state.foodRef=null;state.nutritionEdited=false;mealForm(m)}return}
   if(action==='confirm-delete'){const m=state.meals.find(x=>x.id===button.dataset.id);if(!m)return;openSheet(`${sheetTop('删除这条记录？')}<p class="sheet-description">删除后无法恢复「${esc(m.name)}」及对应的贴纸。</p><div class="two-buttons"><button class="button secondary" data-action="close">取消</button><button class="button" data-action="delete" data-id="${m.id}">确认删除</button></div>`);return}
   if(action==='delete'){await api(`meals/${button.dataset.id}`,{method:'DELETE'});closeSheet();await loadView();toast('已删除饮食记录');return}
   if(action==='start-fast'){await api('fasts',{method:'POST',body:{goal_hours:Number($('#fast-goal').value)}});await loadView();toast('计时已开始');return}
@@ -191,8 +202,17 @@ document.addEventListener('submit',async event=>{
  }catch(e){formError(form,e.message)}finally{if(submit)submit.disabled=false}
 });
 
+document.addEventListener('input',event=>{
+ if(event.target.id==='food-search'){renderFoodResults(event.target.value);return}
+ const form=event.target.closest('#meal-form');if(!form||!state.foodRef)return;
+ if(['calories','carbs','protein','fat'].includes(event.target.name)){
+  state.nutritionEdited=true;const note=$('#nutrition-note',form);if(note)note.textContent='营养值已手动调整，之后修改重量不会自动覆盖。';return;
+ }
+ if(event.target.name==='grams'&&!state.nutritionEdited){const grams=Number(event.target.value);if(!Number.isFinite(grams)||grams<0)return;for(const name of ['calories','carbs','protein','fat'])$(`[name="${name}"]`,form).value=String(Math.round(state.foodRef[name]*grams/10)/10)}
+});
+
 document.addEventListener('change',event=>{
- if(event.target.matches('#camera-input,#gallery-input')){const file=event.target.files[0];event.target.value='';preparePhoto(file)}
+ if(event.target.matches('#camera-input,#gallery-input')){const file=event.target.files[0];event.target.value='';state.foodRef=null;state.nutritionEdited=false;preparePhoto(file)}
  if(event.target.matches('#settings-form [name="provider"]')){
   const provider=event.target.value;$('#provider-fields',sheet).hidden=provider==='local';const model=$('[name="model"]',sheet);model.value=provider==='deepseek'?'deepseek-flash':provider==='openai'?'gpt-4o-mini':'';
  }
