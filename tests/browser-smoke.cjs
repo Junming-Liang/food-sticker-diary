@@ -259,6 +259,7 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await group('早餐').getByText('白米饭（熟，无盐）').waitFor();
     await group('午餐').getByText('番茄炒蛋').waitFor();
     await group('晚餐').getByText('螺蛳粉').waitFor();
+    await buddy.locator('.ring-center').getByText('未计运动消耗').waitFor();
     assert.equal(await buddy.locator('.meal-group .add-mini').count(),0);
     const buddySticker=group('午餐').locator('img.food-thumb');
     await buddySticker.scrollIntoViewIfNeeded();
