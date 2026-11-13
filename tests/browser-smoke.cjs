@@ -24,6 +24,21 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await owner.goto(base);
     await signup(owner,0);
     assert.equal(await owner.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    // Delayed responses from earlier tabs must not replace the newest view.
+    await owner.route('**/api/**',async route => {
+      await new Promise(resolve => setTimeout(resolve,250));
+      await route.continue().catch(() => {});
+    });
+    await owner.getByRole('button',{name:'分析',exact:true}).click();
+    await owner.getByRole('heading',{name:'分析',exact:true}).waitFor();
+    await owner.getByRole('button',{name:'我的',exact:true}).click();
+    await owner.getByRole('heading',{name:'我的',exact:true}).waitFor();
+    await owner.getByRole('button',{name:'断食',exact:true}).click();
+    await owner.getByRole('heading',{name:'轻断食',exact:true}).waitFor();
+    await owner.getByRole('button',{name:'开始计时'}).waitFor();
+    await owner.waitForTimeout(400);
+    assert.equal(await owner.locator('main h1').textContent(),'轻断食');
+    await owner.unroute('**/api/**');
     await owner.getByRole('button',{name:'我的',exact:true}).click();
     await owner.getByRole('button',{name:/热量目标与识别设置/}).click();
     await owner.locator('[name=carbs_goal]').fill('200');
@@ -60,6 +75,12 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await owner.getByRole('button',{name:'保存记录'}).click();
     await owner.getByText('白米饭（熟，无盐）').waitFor();
     await owner.getByText('白米饭（熟，无盐）').click();
+    await owner.locator('#meal-form [name=grams]').fill('200');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'260');
+    await owner.locator('#meal-form [name=calories]').fill('300');
+    await owner.locator('#meal-form [name=grams]').fill('150');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'225');
+    await owner.locator('#meal-form [name=calories]').fill('195');
     await owner.getByRole('button',{name:'添加食物'}).click();
     const second=owner.locator('.food-component').nth(1);
     await second.locator('[data-component-field=name]').fill('鸡蛋');
@@ -76,7 +97,7 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     const detected=[{name:'米饭',grams:100,calories:130,carbs:28,protein:3,fat:0.3},
                     {name:'鸡蛋',grams:50,calories:78,carbs:0.5,protein:6,fat:5}];
     await owner.route('**/api/analyze',route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
-      source:'openai',photo:photo.jpeg,sticker:photo.png,
+      source:'deepseek',photo:photo.jpeg,sticker:photo.png,
       estimate:{name:'一份餐食',grams:150,calories:208,carbs:28.5,protein:9,fat:5.3,components:detected}
     })}));
     await owner.getByRole('button',{name:'添加饮食记录'}).click();
@@ -86,6 +107,16 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     assert.equal(await owner.locator('.food-component').count(),2);
     await owner.locator('.food-component').first().locator('[data-component-field=calories]').fill('150');
     assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'228');
+    await owner.locator('.food-component').first().locator('[data-component-field=grams]').fill('200');
+    assert.equal(await owner.locator('.food-component').first().locator('[data-component-field=calories]').inputValue(),'300');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'378');
+    await owner.locator('#meal-form [name=grams]').fill('500');
+    assert.equal(await owner.locator('.food-component').first().locator('[data-component-field=grams]').inputValue(),'400');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'756');
+    await owner.locator('.food-component').first().locator('[data-component-field=calories]').fill('200');
+    await owner.locator('.food-component').first().locator('[data-component-field=grams]').fill('200');
+    assert.equal(await owner.locator('.food-component').first().locator('[data-component-field=calories]').inputValue(),'100');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'256');
     await owner.getByRole('button',{name:'关闭'}).click();
     await owner.unroute('**/api/analyze');
     await owner.getByRole('button',{name:'添加运动'}).first().click();

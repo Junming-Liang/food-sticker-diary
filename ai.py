@@ -10,6 +10,7 @@ import ssl
 import threading
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -136,15 +137,37 @@ def provider_response(req, provider):
             raise ValueError('OpenAI 桥接端口配置不正确') from exc
         conn = OpenAITunnelConnection(port)
         try:
-            conn.request('POST', '/v1/chat/completions', body=req.data, headers=dict(req.header_items()))
+            url = urlsplit(req.full_url)
+            method = req.get_method()
+            allowed = (method == 'POST' and url.path == '/v1/chat/completions') or (
+                method == 'GET' and re.fullmatch(r'/v1/models/[A-Za-z0-9._%:-]+', url.path))
+            if url.scheme != 'https' or url.netloc != 'api.openai.com' or url.query or not allowed:
+                raise ValueError('OpenAI 请求地址不正确')
+            conn.request(method, url.path, body=req.data, headers=dict(req.header_items()))
             response = conn.getresponse()
             if response.status >= 400:
-                raise HTTPError(req.full_url, response.status, 'API request failed', response.headers, None)
+                raise HTTPError(req.full_url, response.status, 'API request failed', response.headers,
+                                io.BytesIO(response.read(65536)))
             return json.loads(response.read(2 * 1024 * 1024))
         finally:
             conn.close()
     with urlopen(req, timeout=75) as response:
         return json.load(response)
+
+
+def check_openai_model(key, model):
+    req = Request('https://api.openai.com/v1/models/' + quote(model, safe=''),
+                  headers={'Authorization': 'Bearer ' + key})
+    try:
+        provider_response(req, 'openai')
+    except HTTPError as exc:
+        if exc.code in (401,403): raise ValueError('API 密钥无效或当前项目没有权限') from exc
+        if exc.code == 404: raise ValueError('模型不存在或当前 API 项目没有权限，请检查模型名称和项目权限') from exc
+        raise ValueError(f'OpenAI 返回错误（{exc.code}），请检查服务状态') from exc
+    except (URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        if os.environ.get('FOOD_OPENAI_TUNNEL_PORT'):
+            raise ValueError('OpenAI 桥接暂不可用，请检查台式机是否开机联网') from exc
+        raise ValueError('无法连接 OpenAI，请检查网络后重试') from exc
 
 
 def vision_recognize(image, provider, key, model):
@@ -154,11 +177,14 @@ def vision_recognize(image, provider, key, model):
     prompt = ('识别照片中的餐食并分项估算。只返回 JSON 对象，name 为整餐简体中文名称，'
               'components 为数组，每项包含 name（简体中文）、grams（克）、calories（千卡）、'
               'carbs、protein、fat（后三者单位为克）。按可辨认的食物分项，最多 12 项；'
-              '估算整份实际重量和营养，无法确定时给出合理估计，不要添加 Markdown。')
+              '估算整份实际重量和营养，数值须为非负数字；不要凭不清晰的外观强行确定菜名或隐藏的食材。'
+              '菜名、食材或份量不确定时使用较宽泛的名称，并在 uncertainty_note 中简短说明不确定之处，'
+              '提醒用户核对；确定时 uncertainty_note 为空字符串。不要添加 Markdown。')
     data_url = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes(image)).decode()
     body = {'model': model, 'messages': [{'role': 'user', 'content': [
         {'type': 'text', 'text': prompt}, {'type': 'image_url', 'image_url': {'url': data_url}}]}],
-        'response_format': {'type':'json_object'}, 'max_tokens': 1500}
+        'response_format': {'type':'json_object'}}
+    body['max_completion_tokens' if provider == 'openai' else 'max_tokens'] = 1500
     req = Request(endpoints[provider], data=json.dumps(body, ensure_ascii=False).encode(), method='POST',
                   headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     try:
@@ -168,6 +194,8 @@ def vision_recognize(image, provider, key, model):
         result = {'name': str(parsed.get('name', '')).strip()[:80]}
         if not result['name']:
             raise ValueError('识别结果缺少食物名称')
+        note=parsed.get('uncertainty_note')
+        if isinstance(note,str) and note.strip(): result['uncertainty_note']=note.strip()[:300]
         fields=('grams','calories','carbs','protein','fat')
         items=parsed.get('components',parsed.get('items',[]))
         if not isinstance(items,list) or len(items)>12: raise ValueError('识别的食物明细格式有误')
@@ -194,6 +222,12 @@ def vision_recognize(image, provider, key, model):
     except HTTPError as exc:
         if exc.code in (401,403): raise ValueError('API 密钥无效或没有权限，请在设置中检查') from exc
         if exc.code == 429: raise ValueError('识别服务额度不足或请求过多，请稍后再试') from exc
+        if exc.code == 404:
+            try: error_code=json.loads(exc.read(65536)).get('error',{}).get('code')
+            except (AttributeError, ValueError, OSError): error_code=None
+            if error_code=='model_not_found':
+                raise ValueError('模型不存在或当前 API 项目没有权限，请检查模型名称和项目权限') from exc
+            raise ValueError('识别服务返回 404，请检查模型名称及该 API 项目的访问权限') from exc
         raise ValueError(f'识别服务返回错误（{exc.code}），请检查模型名称与服务状态') from exc
     except (URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
         if provider == 'openai' and os.environ.get('FOOD_OPENAI_TUNNEL_PORT'):

@@ -21,6 +21,18 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 import ai
 
+# minimal: one lock protects image creation/deletion and thumbnail publication.
+_image_lock = threading.RLock()
+
+
+def serialized_images(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _image_lock:
+            return function(*args, **kwargs)
+    return wrapped
+
+
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('FOOD_DATA', ROOT / 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -246,6 +258,7 @@ def me():
 
 @app.delete('/api/account')
 @auth
+@serialized_images
 def delete_account():
     if auth_rate_limited(): return jsonify(error='操作太频繁，请稍后再试'), 429
     password = str(body().get('password', ''))
@@ -291,6 +304,17 @@ def settings():
                  (provider,model,saved_key,target,*goals,g.user['id'])); db().commit()
     user = db().execute('SELECT * FROM users WHERE id=?', (g.user['id'],)).fetchone()
     return jsonify(user=public_user(user))
+
+
+@app.post('/api/settings/check')
+@auth
+def check_settings():
+    if g.user['provider'] != 'openai': return jsonify(error='请先保存 OpenAI 识别设置'),400
+    if not g.user['api_key']: return jsonify(error='请先保存 OpenAI API 密钥'),400
+    try:
+        ai.check_openai_model(cipher.decrypt(g.user['api_key'].encode()).decode(),g.user['model'])
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    return jsonify(message='连接成功，当前项目可以查看所选模型；实际识别还取决于额度和模型权限。')
 
 
 def clean_image(file):
@@ -389,6 +413,33 @@ def meal_payload(data):
     return meal_fields(data),cleaned
 
 
+def thumbnail_bytes(image, kind):
+    image = ai.sanitize_sticker(image) if kind == 'sticker' else image.convert('RGB')
+    image.thumbnail((384, 384), Image.Resampling.LANCZOS)
+    if kind == 'sticker': image = ai.sanitize_sticker(image)
+    stream = io.BytesIO()
+    if kind == 'sticker': image.save(stream, format='PNG')
+    else: image.save(stream, format='JPEG', quality=80, optimize=True)
+    return stream.getvalue()
+
+
+def publish_thumbnail(path, content):
+    """Publish an immutable sidecar atomically while coordinating with deletion."""
+    target = path.with_name(path.name + '.thumb')
+    with _image_lock:
+        if not path.is_file(): return None
+        if target.is_file(): return target
+        if shutil.disk_usage(DATA).free < 2 * 1024**3: return None
+        temporary = target.with_name(target.name + '.' + secrets.token_hex(8) + '.tmp')
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as output: output.write(content)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
+
+
 def save_image(data_url, user_id, kind):
     if not data_url: return None
     # Leave room for the other services that share this filesystem.
@@ -409,6 +460,9 @@ def save_image(data_url, user_id, kind):
         path = folder / name
         image.save(path, format='JPEG' if kind=='photo' else 'PNG')
         os.chmod(path, 0o600)
+        # A missing preview is harmless; existing images are also generated lazily.
+        try: publish_thumbnail(path, thumbnail_bytes(image, kind))
+        except OSError: app.logger.warning('Could not cache an image preview')
         return name
     except (ValueError, UnidentifiedImageError, OSError) as exc:
         raise ValueError('无法保存照片') from exc
@@ -418,6 +472,7 @@ def remove_image(user_id, name):
     if name:
         path = UPLOADS / str(user_id) / Path(name).name
         path.unlink(missing_ok=True)
+        path.with_name(path.name + '.thumb').unlink(missing_ok=True)
 
 
 def meal_json(row, shared=False):
@@ -440,6 +495,7 @@ def meals():
 
 @app.post('/api/meals')
 @auth
+@serialized_images
 def create_meal():
     data = body()
     try: fields,components = meal_payload(data)
@@ -479,6 +535,7 @@ def update_meal(mid):
 
 @app.delete('/api/meals/<mid>')
 @auth
+@serialized_images
 def delete_meal(mid):
     row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
     if not row: abort(404)
@@ -492,6 +549,18 @@ def send_meal_image(row, kind):
     if not name: abort(404)
     path = UPLOADS / str(row['user_id']) / Path(name).name
     if not path.is_file(): abort(404)
+    if request.args.get('size') == 'thumbnail':
+        target = path.with_name(path.name + '.thumb')
+        mimetype = 'image/png' if kind == 'sticker' else 'image/jpeg'
+        try:
+            if not target.is_file():
+                with Image.open(path) as image:
+                    content = thumbnail_bytes(image, kind)
+                try: target = publish_thumbnail(path, content)
+                except OSError: target = None
+                if target is None: return send_file(io.BytesIO(content), mimetype=mimetype, conditional=False)
+            return send_file(target, mimetype=mimetype, conditional=False)
+        except (OSError, ValueError): abort(404)
     if kind == 'sticker':
         # Sanitize on output as well, so legacy files remain unchanged on disk.
         try:

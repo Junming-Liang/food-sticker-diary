@@ -81,6 +81,33 @@ class DiaryTest(unittest.TestCase):
         buddy_image=self.bob.get(f'/api/buddy/meals/{mid}/sticker')
         self.assertEqual(buddy_image.status_code,200); buddy_image.close()
 
+    def test_thumbnail_preserves_full_image_and_access_controls(self):
+        image=Image.new('RGBA',(768,512),(19,51,94,0))
+        image.paste((220,70,20,255),(100,100,600,400))
+        stream=io.BytesIO(); image.save(stream,format='PNG')
+        payload={'day':'2026-11-13','category':'lunch','name':'测试','calories':100,
+                 'photo':photo_data(),'sticker':'data:image/png;base64,'+base64.b64encode(stream.getvalue()).decode()}
+        mid=self.alice.post('/api/meals',json=payload).json['meal']['id']
+        with application.app.app_context():
+            row=application.db().execute('SELECT user_id,sticker FROM meals WHERE id=?',(mid,)).fetchone()
+            original=application.UPLOADS/str(row['user_id'])/row['sticker']
+            thumb=original.with_name(original.name+'.thumb')
+            self.assertTrue(thumb.is_file())
+        response=self.alice.get(f'/api/meals/{mid}/sticker?size=thumbnail')
+        self.assertEqual(Image.open(io.BytesIO(response.data)).size,(384,256));response.close()
+        full=self.alice.get(f'/api/meals/{mid}/sticker')
+        self.assertEqual(Image.open(io.BytesIO(full.data)).size,(768,512));full.close()
+        self.assertEqual(self.bob.get(f'/api/meals/{mid}/sticker?size=thumbnail').status_code,404)
+        token=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]['token']
+        thumb.unlink()  # Existing records are populated on their first request.
+        response=self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker?size=thumbnail')
+        small=Image.open(io.BytesIO(response.data)).convert('RGBA')
+        self.assertEqual(small.size,(384,256)); self.assertEqual(small.getpixel((0,0)),(0,0,0,0));response.close()
+        self.assertTrue(thumb.is_file())
+        self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/photo?size=thumbnail').status_code,404)
+        self.alice.delete(f'/api/meals/{mid}')
+        self.assertFalse(original.exists());self.assertFalse(thumb.exists())
+
     def test_macronutrient_goals_are_optional_and_persist(self):
         response=self.alice.put('/api/settings',json={'target':1900,'carbs_goal':200,'protein_goal':95.5,'fat_goal':''})
         self.assertEqual(response.status_code,200)
@@ -176,13 +203,29 @@ class DiaryTest(unittest.TestCase):
 
     def test_vision_result_sums_multiple_foods(self):
         import ai,json
-        content={'name':'米饭和鸡蛋','components':[{'name':'米饭','grams':100,'calories':130,'carbs':28,'protein':3,'fat':0.3},
+        content={'name':'米饭和鸡蛋','uncertainty_note':'做法需要确认','components':[{'name':'米饭','grams':100,'calories':130,'carbs':28,'protein':3,'fat':0.3},
                                                   {'name':'鸡蛋','grams':50,'calories':78,'carbs':0.5,'protein':6,'fat':5}]}
         with patch.object(ai,'provider_response',return_value={'choices':[{'message':{'content':json.dumps(content)}}]}):
             result=ai.vision_recognize(Image.new('RGB',(20,20)),'openai','test-key','gpt-4o-mini')
         self.assertEqual(result['calories'],208)
         self.assertEqual(result['grams'],150)
         self.assertEqual(len(result['components']),2)
+        self.assertEqual(result['uncertainty_note'],'做法需要确认')
+
+    def test_openai_request_and_model_access_error(self):
+        import ai,json
+        from urllib.error import HTTPError
+        content={'name':'米饭','grams':100,'calories':130}
+        with patch.object(ai,'provider_response',return_value={'choices':[{'message':{'content':json.dumps(content)}}]}) as provider:
+            ai.vision_recognize(Image.new('RGB',(20,20)),'openai','test-key','gpt-6.1-terra')
+            payload=json.loads(provider.call_args.args[0].data)
+        self.assertEqual(payload['model'],'gpt-6.1-terra')
+        self.assertEqual(payload['max_completion_tokens'],1500)
+        self.assertNotIn('max_tokens',payload)
+        error=HTTPError('https://api.openai.com/v1/chat/completions',404,'not found',{},io.BytesIO(b'{"error":{"code":"model_not_found"}}'))
+        with patch.object(ai,'provider_response',side_effect=error):
+            with self.assertRaisesRegex(ValueError,'项目没有权限'):
+                ai.vision_recognize(Image.new('RGB',(20,20)),'openai','test-key','gpt-6.1-terra')
 
     def test_exercise_is_private_and_editable(self):
         payload={'day':'2026-11-13','name':'散步','minutes':30,'calories':120}
@@ -265,6 +308,22 @@ class DiaryTest(unittest.TestCase):
         factory.assert_called_once_with(18796)
         self.assertEqual(connection.request.call_args.args[:2],('POST','/v1/chat/completions'))
         connection.close.assert_called_once()
+
+    def test_openai_model_check_is_authenticated_and_uses_saved_settings(self):
+        import ai
+        from unittest.mock import MagicMock
+        connection=MagicMock();response=MagicMock(status=200);response.read.return_value=b'{"id":"gpt-6.1-terra"}'
+        connection.getresponse.return_value=response
+        with patch.dict(os.environ,{'FOOD_OPENAI_TUNNEL_PORT':'18796'}), patch.object(ai,'OpenAITunnelConnection',return_value=connection):
+            ai.check_openai_model('test-key','gpt-6.1-terra')
+        self.assertEqual(connection.request.call_args.args[:2],('GET','/v1/models/gpt-6.1-terra'))
+        self.assertEqual(self.visitor.post('/api/settings/check',json={}).status_code,401)
+        self.alice.put('/api/settings',json={'provider':'openai','model':'gpt-6.1-terra','api_key':'test-key'})
+        with patch.object(ai,'check_openai_model') as check:
+            result=self.alice.post('/api/settings/check',json={})
+        self.assertEqual(result.status_code,200)
+        self.assertNotIn('test-key',str(result.json))
+        check.assert_called_once_with('test-key','gpt-6.1-terra')
 
     def test_vision_request(self):
         import json
