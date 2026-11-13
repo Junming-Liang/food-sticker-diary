@@ -22,3 +22,5 @@
 .component-section{margin:4px 0 14px}.component-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.component-head strong{font-size:14px}.food-component{background:#efefeb;border-radius:12px;padding:12px;margin:8px 0}.food-component .field:last-child{margin-bottom:0}.field input[readonly]{background:#f0f0ec;color:#51514a}
 
 .macro-value{display:block;font-size:14px;line-height:20px;margin-top:4px;overflow-wrap:anywhere}.macro-value small{font-size:12px;font-weight:400;color:#686862}
+
+.weight-chart{display:block;width:100%;height:120px;margin-top:12px}.chart-dates{display:flex;justify-content:space-between;color:#686862;font-size:12px;line-height:16px}

@@ -717,6 +717,15 @@ def weights():
     return jsonify(weights=[dict(row) for row in rows])
 
 
+@app.delete('/api/weights/<day>')
+@auth
+def delete_weight(day):
+    if not valid_day(day): return jsonify(error='请选择有效日期'),400
+    result=db().execute('DELETE FROM weights WHERE user_id=? AND day=?',(g.user['id'],day)); db().commit()
+    if not result.rowcount: return jsonify(error='记录不存在'),404
+    return jsonify(ok=True)
+
+
 @app.route('/api/shares', methods=['GET','POST'])
 @auth
 def shares():

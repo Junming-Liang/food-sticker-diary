@@ -77,6 +77,9 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.post('/api/meals',json={'day':'2026-13-99','name':'x'}).status_code,400)
         self.assertEqual(self.alice.put('/api/water',json={'day':'2026-11-13','amount':500}).json['amount'],500)
         self.assertEqual(self.alice.post('/api/weights',json={'day':'2026-11-13','weight':62.5}).json['weights'][0]['weight'],62.5)
+        self.assertEqual(self.bob.delete('/api/weights/2026-11-13').status_code,404)
+        self.assertEqual(self.alice.delete('/api/weights/2026-11-13').status_code,200)
+        self.assertEqual(self.alice.get('/api/weights').json['weights'],[])
 
     def test_photo_save_keeps_disk_reserve(self):
         from types import SimpleNamespace
