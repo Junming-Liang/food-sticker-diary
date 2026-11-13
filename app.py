@@ -76,7 +76,7 @@ def initialize():
             id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password TEXT NOT NULL, target INTEGER NOT NULL DEFAULT 1800,
             provider TEXT NOT NULL DEFAULT 'local', model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
-            created INTEGER NOT NULL, carbs_goal REAL, protein_goal REAL, fat_goal REAL
+            created INTEGER NOT NULL, carbs_goal REAL, protein_goal REAL, fat_goal REAL, meal_split TEXT
         );
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -154,6 +154,8 @@ def initialize():
         for name in ('carbs_goal','protein_goal','fat_goal'):
             if name not in user_columns:
                 db().execute(f'ALTER TABLE users ADD COLUMN {name} REAL')
+        if 'meal_split' not in user_columns:
+            db().execute('ALTER TABLE users ADD COLUMN meal_split TEXT')
         db().execute('''INSERT OR IGNORE INTO provider_settings(user_id,provider,model,api_key)
                      SELECT id,provider,model,api_key FROM users WHERE provider IN ('openai','deepseek')''')
         db().commit()
@@ -218,7 +220,8 @@ def public_user(user):
     return {'id':user['id'], 'username':user['username'], 'target':user['target'],
             'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key']),
             'provider_options':options,
-            'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal']}
+            'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal'],
+            'meal_split':json.loads(user['meal_split']) if user['meal_split'] else None}
 
 
 def issue_session(user):
@@ -388,6 +391,18 @@ def settings():
         except (TypeError,ValueError): return jsonify(error='请输入有效的营养目标'),400
         if not 0.1 <= value <= 2000: return jsonify(error='营养目标需在 0.1 至 2000 克之间'),400
         goals.append(round(value,1))
+    meal_split=current['meal_split']
+    if 'meal_split' in data:
+        split=data['meal_split']
+        categories=('breakfast','lunch','dinner','snack')
+        if split is None:
+            meal_split=None
+        elif (not isinstance(split,dict) or set(split)!=set(categories) or
+              any(type(split[name]) is not int or not 0<=split[name]<=100 for name in categories) or
+              sum(split.values())!=100):
+            return jsonify(error='请填写四餐 0 至 100 的整数比例，合计须为 100%'),400
+        else:
+            meal_split=json.dumps(split,separators=(',',':'))
     raw_key = str(data.get('api_key', '')).strip()
     if len(raw_key)>512 or any(ord(c)<32 for c in raw_key): return jsonify(error='API 密钥格式不正确'), 400
     # Each service keeps its own encrypted key; never send one service another service's key.
@@ -400,8 +415,8 @@ def settings():
                       ON CONFLICT(user_id,provider) DO UPDATE SET model=excluded.model,api_key=excluded.api_key''',
                      (g.user['id'],provider,model,saved_key))
     db().execute('''UPDATE users SET provider=?,model=?,api_key=?,target=?,
-                 carbs_goal=?,protein_goal=?,fat_goal=? WHERE id=?''',
-                 (provider,model,saved_key,target,*goals,g.user['id'])); db().commit()
+                 carbs_goal=?,protein_goal=?,fat_goal=?,meal_split=? WHERE id=?''',
+                 (provider,model,saved_key,target,*goals,meal_split,g.user['id'])); db().commit()
     user = db().execute('SELECT * FROM users WHERE id=?', (g.user['id'],)).fetchone()
     return jsonify(user=public_user(user))
 
@@ -786,14 +801,15 @@ def own_buddy():
 def buddy():
     own = own_buddy()
     if not own: return jsonify(paired=False)
-    other = db().execute('''SELECT buddy_members.*, users.username, users.target FROM buddy_members
+    other = db().execute('''SELECT buddy_members.*, users.username, users.target, users.meal_split FROM buddy_members
         JOIN users ON users.id=buddy_members.user_id WHERE pair_id=? AND user_id<>?''',
         (own['pair_id'],g.user['id'])).fetchone()
     if not other: return jsonify(paired=False)
     day=request.args.get('day','')
     if not valid_day(day): return jsonify(error='请选择有效的日期'),400
     result = {'paired':True, 'username':other['username'], 'sharing':bool(own['sharing']),
-              'other_sharing':bool(other['sharing']), 'target':other['target'] if other['sharing'] else None, 'meals':[]}
+              'other_sharing':bool(other['sharing']), 'target':other['target'] if other['sharing'] else None,
+              'meal_split':json.loads(other['meal_split']) if other['sharing'] and other['meal_split'] else None, 'meals':[]}
     if other['sharing']:
         rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
                             (other['user_id'],day)).fetchall()

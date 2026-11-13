@@ -193,6 +193,33 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.put('/api/settings',json={'carbs_goal':0.04}).status_code,400)
         self.assertIsNone(self.bob.get('/api/me').json['user']['carbs_goal'])
 
+    def test_meal_split_is_optional_validated_and_shared_only_with_consent(self):
+        split={'breakfast':25,'lunch':35,'dinner':30,'snack':10}
+        self.assertIsNone(self.alice.get('/api/me').json['user']['meal_split'])
+        self.assertEqual(self.visitor.put('/api/settings',json={'meal_split':split}).status_code,401)
+        self.alice.put('/api/settings',json={'provider':'deepseek','model':'deepseek-flash','api_key':'test-key'})
+        for invalid in ({'breakfast':25,'lunch':35,'dinner':30,'snack':9},
+                        {'breakfast':25,'lunch':35,'dinner':30},
+                        {'breakfast':25,'lunch':35,'dinner':30,'snack':10,'other':0},
+                        {'breakfast':True,'lunch':35,'dinner':54,'snack':10},
+                        {'breakfast':'25','lunch':35,'dinner':30,'snack':10},
+                        {'breakfast':-1,'lunch':35,'dinner':56,'snack':10},[25,35,30,10]):
+            self.assertEqual(self.alice.put('/api/settings',json={'target':2100,'meal_split':invalid}).status_code,400)
+        self.assertEqual(self.alice.get('/api/me').json['user']['target'],1800)
+        user=self.alice.put('/api/settings',json={'target':1801,'meal_split':split}).json['user']
+        self.assertEqual(user['meal_split'],split);self.assertEqual(user['target'],1801)
+        self.assertTrue(user['has_key']);self.assertEqual(user['model'],'deepseek-flash')
+        self.assertIsNone(self.bob.get('/api/me').json['user']['meal_split'])
+        token=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':token})
+        shared=self.bob.get('/api/buddy?day=2026-11-13').json
+        self.assertEqual(shared['meal_split'],split);self.assertEqual(shared['target'],1801)
+        self.alice.put('/api/buddy/sharing',json={'enabled':False})
+        paused=self.bob.get('/api/buddy?day=2026-11-13').json
+        self.assertIsNone(paused['meal_split']);self.assertIsNone(paused['target'])
+        self.assertIsNone(self.alice.put('/api/settings',json={'meal_split':None}).json['user']['meal_split'])
+        self.assertEqual(self.alice.get('/api/me').json['user']['target'],1801)
+
     def test_settings_encrypted_and_origin_rejected(self):
         resp=self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-secret-value','model':'deepseek-flash','target':1900})
         self.assertEqual(resp.status_code,200)
@@ -326,6 +353,7 @@ class DiaryTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
             self.assertEqual(conn.execute("SELECT sticker_border,sticker_color,sticker_rendered FROM meals WHERE id='old'").fetchone(),(0,'#ffffff',None))
             self.assertEqual(conn.execute("SELECT username,target,carbs_goal,protein_goal,fat_goal FROM users WHERE id=1").fetchone(),('legacy',1900,None,None,None))
+            self.assertIsNone(conn.execute("SELECT meal_split FROM users WHERE id=1").fetchone()[0])
             self.assertEqual(conn.execute("SELECT provider,model,api_key FROM provider_settings WHERE user_id=2").fetchone(),('deepseek','old-model','encrypted-old-key'))
             conn.close()
 
