@@ -403,6 +403,7 @@ def save_image(data_url, user_id, kind):
         if image.width * image.height > 4_000_000: raise ValueError('图片尺寸过大')
         image.load()
         image = image.convert('RGB' if kind == 'photo' else 'RGBA')
+        if kind == 'sticker': image = ai.sanitize_sticker(image)
         folder = UPLOADS / str(user_id); folder.mkdir(exist_ok=True, mode=0o700)
         name = secrets.token_hex(16) + ('.jpg' if kind == 'photo' else '.png')
         path = folder / name
@@ -419,9 +420,9 @@ def remove_image(user_id, name):
         path.unlink(missing_ok=True)
 
 
-def meal_json(row):
+def meal_json(row, shared=False):
     return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created')} | {
-        'has_photo':bool(row['image']), 'has_sticker':bool(row['sticker']),
+        'has_photo':bool(row['image']) and not shared, 'has_sticker':bool(row['sticker']),
         'components':json.loads(row['components'])}
 
 
@@ -491,7 +492,16 @@ def send_meal_image(row, kind):
     if not name: abort(404)
     path = UPLOADS / str(row['user_id']) / Path(name).name
     if not path.is_file(): abort(404)
-    return send_file(path, mimetype='image/png' if kind=='sticker' else 'image/jpeg', conditional=False)
+    if kind == 'sticker':
+        # Sanitize on output as well, so legacy files remain unchanged on disk.
+        try:
+            with Image.open(path) as image:
+                stream = io.BytesIO()
+                ai.sanitize_sticker(image).save(stream, format='PNG')
+                stream.seek(0)
+        except (OSError, ValueError): abort(404)
+        return send_file(stream, mimetype='image/png', conditional=False)
+    return send_file(path, mimetype='image/jpeg', conditional=False)
 
 
 @app.get('/api/meals/<mid>/<kind>')
@@ -522,7 +532,7 @@ def buddy():
     if other['sharing']:
         rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
                             (other['user_id'],day)).fetchall()
-        result['meals'] = [meal_json(row) for row in rows]
+        result['meals'] = [meal_json(row, shared=True) for row in rows]
     return jsonify(result)
 
 
@@ -597,6 +607,7 @@ def delete_buddy():
 @app.get('/api/buddy/meals/<mid>/<kind>')
 @auth
 def buddy_image(mid,kind):
+    if kind != 'sticker': abort(404)
     own=own_buddy()
     if not own: abort(404)
     row=db().execute('''SELECT meals.* FROM meals JOIN buddy_members ON buddy_members.user_id=meals.user_id
@@ -761,11 +772,12 @@ def shared(token):
     user = db().execute('SELECT username FROM users WHERE id=?', (share['user_id'],)).fetchone()
     rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
                         (share['user_id'],share['day'])).fetchall()
-    return jsonify(owner=user['username'],day=share['day'],meals=[meal_json(row) for row in rows],expires=share['expires'])
+    return jsonify(owner=user['username'],day=share['day'],meals=[meal_json(row, shared=True) for row in rows],expires=share['expires'])
 
 
 @app.get('/api/shared/<token>/image/<mid>/<kind>')
 def shared_image(token,mid,kind):
+    if kind != 'sticker': abort(404)
     share=shared_row(token)
     if not share: abort(404)
     row=db().execute('SELECT * FROM meals WHERE id=? AND user_id=? AND day=?',

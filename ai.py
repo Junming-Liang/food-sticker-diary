@@ -70,6 +70,13 @@ def jpeg_bytes(image):
     return stream.getvalue()
 
 
+def sanitize_sticker(image):
+    """Remove hidden image data from transparent and almost transparent pixels."""
+    pixels = np.asarray(image.convert('RGBA'), dtype=np.uint8).copy()
+    pixels[pixels[:, :, 3] < 16] = 0
+    return Image.fromarray(pixels)
+
+
 def sticker(image):
     """U2NetP produces a subject alpha matte; return a transparent PNG."""
     with _lock:
@@ -86,7 +93,7 @@ def sticker(image):
         alpha = Image.fromarray(mask).resize(src.size, Image.Resampling.LANCZOS)
         src.putalpha(alpha)
         stream = io.BytesIO()
-        src.save(stream, 'PNG', optimize=True)
+        sanitize_sticker(src).save(stream, 'PNG', optimize=True)
         return stream.getvalue()
 
 

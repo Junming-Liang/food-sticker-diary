@@ -48,6 +48,39 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.visitor.get(f'/api/shared/{token}').status_code,404)
         self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker').status_code,404)
 
+    def test_shared_stickers_hide_original_photo_and_transparent_pixel_data(self):
+        background=Image.new('RGBA',(20,20),(19,51,94,0))
+        background.putpixel((10,10),(220,70,20,255))
+        background.putpixel((1,1),(19,51,94,5))
+        stream=io.BytesIO();background.save(stream,format='PNG')
+        sticker='data:image/png;base64,'+base64.b64encode(stream.getvalue()).decode()
+        payload={'day':'2026-11-13','category':'lunch','name':'测试餐','calories':180,
+                 'photo':photo_data(),'sticker':sticker}
+        meal=self.alice.post('/api/meals',json=payload).json['meal'];mid=meal['id']
+        # A legacy sticker may still contain the entire original image in transparent RGB pixels.
+        with application.app.app_context():
+            row=application.db().execute('SELECT user_id,sticker FROM meals WHERE id=?',(mid,)).fetchone()
+            path=application.UPLOADS / str(row['user_id']) / row['sticker']
+            path.write_bytes(stream.getvalue())
+        token=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]['token']
+        visible=self.visitor.get(f'/api/shared/{token}').json['meals'][0]
+        self.assertFalse(visible['has_photo'])
+        self.assertEqual(self.visitor.get(f'/api/shared/{token}/image/{mid}/photo').status_code,404)
+        response=self.visitor.get(f'/api/shared/{token}/image/{mid}/sticker')
+        image=Image.open(io.BytesIO(response.data)).convert('RGBA')
+        self.assertEqual(image.getpixel((0,0)),(0,0,0,0))
+        self.assertEqual(image.getpixel((1,1)),(0,0,0,0))
+        self.assertEqual(image.getpixel((10,10)),(220,70,20,255))
+        self.assertEqual(path.read_bytes(),stream.getvalue())
+        owner_photo=self.alice.get(f'/api/meals/{mid}/photo')
+        self.assertEqual(owner_photo.status_code,200); owner_photo.close()
+        invite=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':invite})
+        self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['meals'][0]['has_photo'])
+        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/photo').status_code,404)
+        buddy_image=self.bob.get(f'/api/buddy/meals/{mid}/sticker')
+        self.assertEqual(buddy_image.status_code,200); buddy_image.close()
+
     def test_macronutrient_goals_are_optional_and_persist(self):
         response=self.alice.put('/api/settings',json={'target':1900,'carbs_goal':200,'protein_goal':95.5,'fat_goal':''})
         self.assertEqual(response.status_code,200)
@@ -177,7 +210,7 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.delete(f"/api/fasts/{active['id']}").status_code,200)
 
     def test_buddy_sharing_requires_consent_and_can_be_paused(self):
-        payload={'day':'2026-11-13','category':'lunch','name':'测试餐','calories':180,'photo':photo_data()}
+        payload={'day':'2026-11-13','category':'lunch','name':'测试餐','calories':180,'photo':photo_data(),'sticker':photo_data('RGBA')}
         mid=self.alice.post('/api/meals',json=payload).json['meal']['id']
         token=self.alice.post('/api/buddy/invites',json={}).json['token']
         self.assertEqual(self.alice.post('/api/buddy/accept',json={'token':token}).status_code,400)
@@ -186,17 +219,17 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.bob.get(f'/api/buddy/invites/{token}').status_code,404)
         result=self.bob.get('/api/buddy?day=2026-11-13').json
         self.assertEqual(result['meals'][0]['id'],mid)
-        image_response=self.bob.get(f'/api/buddy/meals/{mid}/photo')
+        image_response=self.bob.get(f'/api/buddy/meals/{mid}/sticker')
         self.assertEqual(image_response.status_code,200); image_response.close()
         self.assertEqual(self.visitor.get(f'/api/buddy/meals/{mid}/photo').status_code,401)
         self.alice.put('/api/buddy/sharing',json={'enabled':False})
         self.assertFalse(self.bob.get('/api/buddy?day=2026-11-13').json['other_sharing'])
-        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/photo').status_code,404)
+        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/sticker').status_code,404)
         self.alice.put('/api/buddy/sharing',json={'enabled':True})
         self.assertEqual(len(self.bob.get('/api/buddy?day=2026-11-13').json['meals']),1)
         self.bob.delete('/api/buddy')
         self.assertFalse(self.alice.get('/api/buddy?day=2026-11-13').json['paired'])
-        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/photo').status_code,404)
+        self.assertEqual(self.bob.get(f'/api/buddy/meals/{mid}/sticker').status_code,404)
 
     def test_delete_account_revokes_shares_and_data(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
