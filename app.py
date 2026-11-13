@@ -1,0 +1,505 @@
+"""Food Sticker Diary: authenticated meal journal and opt-in sharing."""
+import base64
+import hashlib
+import io
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import time
+from datetime import date, datetime, timedelta, timezone
+from functools import wraps
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from cryptography.fernet import Fernet
+from flask import Flask, abort, g, jsonify, request, send_file, send_from_directory
+from PIL import Image, ImageOps, UnidentifiedImageError
+from werkzeug.security import check_password_hash, generate_password_hash
+import ai
+
+ROOT = Path(__file__).resolve().parent
+DATA = Path(os.environ.get('FOOD_DATA', ROOT / 'data')).resolve()
+DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+UPLOADS = DATA / 'images'
+UPLOADS.mkdir(exist_ok=True, mode=0o700)
+KEY_FILE = DATA / 'secret.key'
+if not KEY_FILE.exists():
+    try:
+        fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'wb') as key_file: key_file.write(Fernet.generate_key())
+    except FileExistsError:
+        pass
+cipher = Fernet(KEY_FILE.read_bytes())
+_base = os.environ.get('FOOD_BASE', '/food-diary/').strip('/')
+BASE = '/' + (_base + '/' if _base else '')
+app = Flask(__name__, static_folder=None)
+app.config['MAX_CONTENT_LENGTH'] = 12 * 1024 * 1024
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FOOD_COOKIE_SECURE', '1') != '0'
+
+
+def db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DATA / 'diary.sqlite3', timeout=15)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute('PRAGMA foreign_keys = ON')
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exc):
+    if 'db' in g: g.db.close()
+
+
+def initialize():
+    with app.app_context():
+        db().executescript('''
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password TEXT NOT NULL, target INTEGER NOT NULL DEFAULT 1800,
+            provider TEXT NOT NULL DEFAULT 'local', model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
+            created INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            expires INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS meals (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, category TEXT NOT NULL, name TEXT NOT NULL,
+            grams REAL NOT NULL, calories REAL NOT NULL, carbs REAL NOT NULL, protein REAL NOT NULL, fat REAL NOT NULL,
+            image TEXT, sticker TEXT, created INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS meals_user_day ON meals(user_id,day);
+        CREATE TABLE IF NOT EXISTS shares (
+            id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token_cipher TEXT NOT NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS water (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY(user_id, day)
+        );
+        CREATE TABLE IF NOT EXISTS weights (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY(user_id, day)
+        );
+        ''')
+        db().commit()
+
+
+@app.before_request
+def before():
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        origin = request.headers.get('Origin')
+        if origin and (urlsplit(origin).netloc.lower() != request.host.lower() or urlsplit(origin).scheme not in ('http','https')):
+            return jsonify(error='请求来源不匹配'), 403
+    raw = request.cookies.get('food_session', '')
+    g.user = None
+    if raw:
+        g.user = db().execute('''SELECT users.* FROM sessions JOIN users ON sessions.user_id=users.id
+            WHERE sessions.token_hash=? AND sessions.expires>?''', (digest(raw), int(time.time()))).fetchone()
+
+
+@app.after_request
+def security(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(), geolocation=()'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    return response
+
+
+@app.errorhandler(413)
+def too_large(exc): return jsonify(error='照片太大，请选择小于 12 MB 的图片'), 413
+
+
+def digest(token): return hashlib.sha256(token.encode()).hexdigest()
+
+
+def auth(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not g.user: return jsonify(error='请先登录'), 401
+        return f(*args, **kwargs)
+    return wrapped
+
+
+def body(): return request.get_json(silent=True) or {}
+
+
+def valid_day(value):
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except (TypeError, ValueError): return False
+
+
+def public_user(user):
+    return {'id':user['id'], 'username':user['username'], 'target':user['target'],
+            'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key'])}
+
+
+def issue_session(user):
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    db().execute('DELETE FROM sessions WHERE expires<?', (now,))
+    db().execute('INSERT INTO sessions VALUES (?,?,?)', (digest(token), user['id'], now + 60*60*24*30))
+    db().commit()
+    response = jsonify(user=public_user(user))
+    response.set_cookie('food_session', token, max_age=60*60*24*30, httponly=True,
+                        secure=app.config['SESSION_COOKIE_SECURE'], samesite='Lax', path=BASE)
+    return response
+
+
+_attempts = {}
+def auth_rate_limited():
+    # minimal: in-memory per-IP limit; move to a shared store if multiple server workers are used.
+    now = time.time(); ip = request.headers.get('X-Real-IP', request.remote_addr or '')
+    hits = [t for t in _attempts.get(ip, []) if t > now-600]
+    _attempts[ip] = hits
+    if len(hits) >= 20: return True
+    hits.append(now)
+    return False
+
+
+@app.post('/api/auth/register')
+def register():
+    if auth_rate_limited(): return jsonify(error='操作太频繁，请稍后再试'), 429
+    data = body(); username = str(data.get('username', '')).strip(); password = str(data.get('password', ''))
+    if not 2 <= len(username) <= 32 or not re.fullmatch(r'[\w\u4e00-\u9fff.\-]+', username):
+        return jsonify(error='用户名需为 2 至 32 位，只能包含文字、字母、数字、点或横线'), 400
+    if not 8 <= len(password) <= 128: return jsonify(error='密码长度需为 8 至 128 位'), 400
+    try:
+        cursor = db().execute('INSERT INTO users(username,password,created) VALUES (?,?,?)',
+                              (username, generate_password_hash(password), int(time.time())))
+        db().commit()
+    except sqlite3.IntegrityError:
+        return jsonify(error='这个用户名已被使用'), 409
+    return issue_session(db().execute('SELECT * FROM users WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+
+@app.post('/api/auth/login')
+def login():
+    if auth_rate_limited(): return jsonify(error='操作太频繁，请稍后再试'), 429
+    data = body(); username = str(data.get('username','')).strip(); password = str(data.get('password',''))
+    user = db().execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    if not user or len(password) > 128 or not check_password_hash(user['password'], password):
+        return jsonify(error='用户名或密码不正确'), 401
+    return issue_session(user)
+
+
+@app.post('/api/auth/logout')
+@auth
+def logout():
+    token = request.cookies.get('food_session', '')
+    db().execute('DELETE FROM sessions WHERE token_hash=?', (digest(token),)); db().commit()
+    response = jsonify(ok=True); response.delete_cookie('food_session', path=BASE)
+    return response
+
+
+@app.get('/api/me')
+def me():
+    return jsonify(user=public_user(g.user) if g.user else None)
+
+
+@app.delete('/api/account')
+@auth
+def delete_account():
+    if auth_rate_limited(): return jsonify(error='操作太频繁，请稍后再试'), 429
+    password = str(body().get('password', ''))
+    if len(password) > 128 or not check_password_hash(g.user['password'], password):
+        return jsonify(error='密码不正确'), 401
+    user_id = g.user['id']
+    # Remove the image files before deleting the account so an I/O error remains retryable.
+    folder = UPLOADS / str(user_id)
+    if folder.is_dir(): shutil.rmtree(folder)
+    db().execute('DELETE FROM users WHERE id=?', (user_id,)); db().commit()
+    response = jsonify(ok=True); response.delete_cookie('food_session', path=BASE)
+    return response
+
+
+@app.put('/api/settings')
+@auth
+def settings():
+    data = body(); provider = data.get('provider', g.user['provider'])
+    if provider not in ('local', 'openai', 'deepseek'): return jsonify(error='请选择有效的识别服务'), 400
+    defaults = {'openai':'gpt-4o-mini', 'deepseek':'deepseek-flash', 'local':''}
+    model = str(data.get('model', '')).strip()[:100] or defaults[provider]
+    if model and not re.fullmatch(r'[\w.\-:]+', model): return jsonify(error='模型名称格式不正确'), 400
+    try: target = int(data.get('target', g.user['target']))
+    except (TypeError, ValueError): return jsonify(error='请输入有效的每日目标'), 400
+    if not 500 <= target <= 10000: return jsonify(error='每日目标需在 500 至 10000 千卡之间'), 400
+    raw_key = str(data.get('api_key', '')).strip()
+    if len(raw_key)>512 or any(ord(c)<32 for c in raw_key): return jsonify(error='API 密钥格式不正确'), 400
+    # A credential belongs to one provider: switching providers never reuses another provider's key.
+    saved_key = g.user['api_key'] if provider == g.user['provider'] else ''
+    if data.get('clear_key'): saved_key = ''
+    elif raw_key: saved_key = cipher.encrypt(raw_key.encode()).decode()
+    db().execute('UPDATE users SET provider=?,model=?,api_key=?,target=? WHERE id=?',
+                 (provider,model,saved_key,target,g.user['id'])); db().commit()
+    user = db().execute('SELECT * FROM users WHERE id=?', (g.user['id'],)).fetchone()
+    return jsonify(user=public_user(user))
+
+
+def clean_image(file):
+    if not file: raise ValueError('请选择食物照片')
+    try:
+        Image.MAX_IMAGE_PIXELS = 24_000_000
+        image = Image.open(file)
+        if image.width * image.height > 24_000_000:
+            raise ValueError('照片尺寸过大，请选择较小的图片')
+        if image.format not in ('JPEG','PNG','WEBP'):
+            raise ValueError('请选择 JPG、PNG 或 WebP 照片')
+        image = ImageOps.exif_transpose(image).convert('RGB')
+        image.thumbnail((1280,1280), Image.Resampling.LANCZOS)
+        return image
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
+        raise ValueError('无法读取照片，请换一张图片') from exc
+
+
+@app.post('/api/analyze')
+@auth
+def analyze():
+    try: image = clean_image(request.files.get('image'))
+    except ValueError as exc: return jsonify(error=str(exc)), 400
+    # Every photo is reencoded before any storage or external provider request, stripping metadata.
+    photo = ai.jpeg_bytes(image)
+    result = {'photo':'data:image/jpeg;base64,' + base64.b64encode(photo).decode(), 'sticker':None}
+    try:
+        result['sticker'] = 'data:image/png;base64,' + base64.b64encode(ai.sticker(image)).decode()
+    except (FileNotFoundError, ValueError, RuntimeError):
+        result['sticker_error'] = '贴纸暂时无法生成，仍可保存原照片'
+    provider = g.user['provider']
+    try:
+        if provider in ('openai','deepseek'):
+            if not g.user['api_key']: raise ValueError('请先在「我的」中配置 API 密钥')
+            key = cipher.decrypt(g.user['api_key'].encode()).decode()
+            result['estimate'] = ai.vision_recognize(image, provider, key, g.user['model'])
+            result['source'] = provider
+        else:
+            result['candidates'] = ai.local_recognize(image)
+            result['source'] = 'local'
+    except FileNotFoundError:
+        result['recognition_error'] = '本地识别模型尚未安装，可配置 AI 服务或手动填写'
+    except Exception as exc:
+        app.logger.warning('Photo recognition failed: %s', type(exc).__name__)
+        result['recognition_error'] = str(exc) if isinstance(exc, ValueError) else '识别失败，请检查服务配置后重试'
+    return jsonify(result)
+
+
+def meal_fields(data):
+    day = str(data.get('day','')); category = str(data.get('category','')); name = str(data.get('name','')).strip()
+    if not valid_day(day): raise ValueError('请选择有效的日期')
+    if category not in ('breakfast','lunch','dinner','snack'): raise ValueError('请选择餐次')
+    if not 1 <= len(name) <= 80: raise ValueError('请输入食物名称')
+    values = []
+    for field in ('grams','calories','carbs','protein','fat'):
+        try: value = float(data.get(field) or 0)
+        except (ValueError, TypeError): raise ValueError('请填写有效的营养数值')
+        if not 0 <= value <= 100000: raise ValueError('营养数值超出范围')
+        values.append(round(value, 1))
+    return [day, category, name, *values]
+
+
+def save_image(data_url, user_id, kind):
+    if not data_url: return None
+    expected = 'data:image/jpeg;base64,' if kind == 'photo' else 'data:image/png;base64,'
+    if not isinstance(data_url,str) or not data_url.startswith(expected) or len(data_url) > 10_000_000:
+        raise ValueError('图片格式不正确')
+    try:
+        raw = base64.b64decode(data_url[len(expected):], validate=True)
+        image = Image.open(io.BytesIO(raw))
+        if image.width * image.height > 4_000_000: raise ValueError('图片尺寸过大')
+        image.load()
+        image = image.convert('RGB' if kind == 'photo' else 'RGBA')
+        folder = UPLOADS / str(user_id); folder.mkdir(exist_ok=True, mode=0o700)
+        name = secrets.token_hex(16) + ('.jpg' if kind == 'photo' else '.png')
+        path = folder / name
+        image.save(path, format='JPEG' if kind=='photo' else 'PNG')
+        os.chmod(path, 0o600)
+        return name
+    except (ValueError, UnidentifiedImageError, OSError) as exc:
+        raise ValueError('无法保存照片') from exc
+
+
+def remove_image(user_id, name):
+    if name:
+        path = UPLOADS / str(user_id) / Path(name).name
+        path.unlink(missing_ok=True)
+
+
+def meal_json(row):
+    return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created')} | {
+        'has_photo':bool(row['image']), 'has_sticker':bool(row['sticker'])}
+
+
+@app.get('/api/meals')
+@auth
+def meals():
+    day = request.args.get('day',''); start = request.args.get('start',''); end = request.args.get('end','')
+    if valid_day(day): start = end = day
+    if not valid_day(start) or not valid_day(end) or start>end:
+        return jsonify(error='请选择有效的日期范围'), 400
+    rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day BETWEEN ? AND ? ORDER BY day DESC,created DESC',
+                        (g.user['id'],start,end)).fetchall()
+    return jsonify(meals=[meal_json(row) for row in rows])
+
+
+@app.post('/api/meals')
+@auth
+def create_meal():
+    data = body()
+    try: fields = meal_fields(data)
+    except ValueError as exc: return jsonify(error=str(exc)), 400
+    photo = sticker = None
+    try:
+        photo = save_image(data.get('photo'),g.user['id'],'photo')
+        sticker = save_image(data.get('sticker'),g.user['id'],'sticker')
+        mid = secrets.token_hex(16)
+        db().execute('INSERT INTO meals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                     (mid,g.user['id'],*fields,photo,sticker,int(time.time())))
+        db().commit()
+    except Exception as exc:
+        remove_image(g.user['id'], photo); remove_image(g.user['id'], sticker)
+        if isinstance(exc, ValueError): return jsonify(error=str(exc)), 400
+        raise
+    row = db().execute('SELECT * FROM meals WHERE id=?', (mid,)).fetchone()
+    return jsonify(meal=meal_json(row)), 201
+
+
+@app.put('/api/meals/<mid>')
+@auth
+def update_meal(mid):
+    row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
+    if not row: abort(404)
+    try: fields = meal_fields(body())
+    except ValueError as exc: return jsonify(error=str(exc)), 400
+    db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?
+                    WHERE id=? AND user_id=?''', (*fields,mid,g.user['id'])); db().commit()
+    return jsonify(meal=meal_json(db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()))
+
+
+@app.delete('/api/meals/<mid>')
+@auth
+def delete_meal(mid):
+    row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
+    if not row: abort(404)
+    db().execute('DELETE FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])); db().commit()
+    remove_image(g.user['id'],row['image']); remove_image(g.user['id'],row['sticker'])
+    return jsonify(ok=True)
+
+
+def send_meal_image(row, kind):
+    name = row['sticker'] if kind=='sticker' else row['image'] if kind=='photo' else None
+    if not name: abort(404)
+    path = UPLOADS / str(row['user_id']) / Path(name).name
+    if not path.is_file(): abort(404)
+    return send_file(path, mimetype='image/png' if kind=='sticker' else 'image/jpeg', conditional=False)
+
+
+@app.get('/api/meals/<mid>/<kind>')
+@auth
+def meal_image(mid,kind):
+    row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
+    if not row: abort(404)
+    return send_meal_image(row,kind)
+
+
+@app.route('/api/water', methods=['GET','PUT'])
+@auth
+def water():
+    data = body() if request.method == 'PUT' else request.args
+    day = data.get('day','')
+    if not valid_day(day): return jsonify(error='请选择有效日期'), 400
+    if request.method == 'PUT':
+        try: amount = int(data.get('amount',0))
+        except (ValueError,TypeError): return jsonify(error='请输入有效的饮水量'),400
+        if not 0 <= amount <= 10000: return jsonify(error='饮水量需在 0 至 10000 毫升之间'),400
+        db().execute('INSERT INTO water VALUES (?,?,?) ON CONFLICT(user_id,day) DO UPDATE SET amount=excluded.amount',
+                     (g.user['id'],day,amount)); db().commit()
+    row = db().execute('SELECT amount FROM water WHERE user_id=? AND day=?',(g.user['id'],day)).fetchone()
+    return jsonify(amount=row['amount'] if row else 0)
+
+
+@app.route('/api/weights', methods=['GET','POST'])
+@auth
+def weights():
+    if request.method=='POST':
+        data = body(); day = data.get('day','')
+        try: weight = float(data.get('weight'))
+        except (ValueError,TypeError): return jsonify(error='请输入有效的体重'),400
+        if not valid_day(day) or not 10 <= weight <= 500: return jsonify(error='请检查日期和体重'),400
+        db().execute('INSERT INTO weights VALUES (?,?,?) ON CONFLICT(user_id,day) DO UPDATE SET weight=excluded.weight',
+                     (g.user['id'],day,round(weight,1))); db().commit()
+    rows = db().execute('SELECT day,weight FROM weights WHERE user_id=? ORDER BY day DESC LIMIT 60',(g.user['id'],)).fetchall()
+    return jsonify(weights=[dict(row) for row in rows])
+
+
+@app.route('/api/shares', methods=['GET','POST'])
+@auth
+def shares():
+    now = int(time.time())
+    if request.method=='POST':
+        data = body(); day = data.get('day','')
+        if not valid_day(day): return jsonify(error='请选择有效日期'),400
+        token = secrets.token_urlsafe(32); sid = secrets.token_hex(16)
+        expires = now + 7*86400
+        db().execute('INSERT INTO shares VALUES (?,?,?,?,?,?,?)',
+                     (sid,digest(token),cipher.encrypt(token.encode()).decode(),g.user['id'],day,now,expires)); db().commit()
+    rows = db().execute('SELECT * FROM shares WHERE user_id=? AND expires>? ORDER BY created DESC', (g.user['id'],now)).fetchall()
+    return jsonify(shares=[{'id':row['id'],'day':row['day'],'expires':row['expires'],
+                            'token':cipher.decrypt(row['token_cipher'].encode()).decode()} for row in rows])
+
+
+@app.delete('/api/shares/<sid>')
+@auth
+def delete_share(sid):
+    db().execute('DELETE FROM shares WHERE id=? AND user_id=?', (sid,g.user['id'])); db().commit()
+    return jsonify(ok=True)
+
+
+def shared_row(token):
+    if len(token)>100: return None
+    return db().execute('SELECT * FROM shares WHERE token_hash=? AND expires>?', (digest(token), int(time.time()))).fetchone()
+
+
+@app.get('/api/shared/<token>')
+def shared(token):
+    share = shared_row(token)
+    if not share: return jsonify(error='分享链接无效或已过期'),404
+    user = db().execute('SELECT username FROM users WHERE id=?', (share['user_id'],)).fetchone()
+    rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
+                        (share['user_id'],share['day'])).fetchall()
+    return jsonify(owner=user['username'],day=share['day'],meals=[meal_json(row) for row in rows],expires=share['expires'])
+
+
+@app.get('/api/shared/<token>/image/<mid>/<kind>')
+def shared_image(token,mid,kind):
+    share=shared_row(token)
+    if not share: abort(404)
+    row=db().execute('SELECT * FROM meals WHERE id=? AND user_id=? AND day=?',
+                     (mid,share['user_id'],share['day'])).fetchone()
+    if not row: abort(404)
+    return send_meal_image(row,kind)
+
+
+@app.get('/')
+def index(): return send_from_directory(ROOT / 'web','index.html')
+
+
+@app.get('/<path:path>')
+def static_files(path):
+    if path.startswith('api/'): abort(404)
+    return send_from_directory(ROOT / 'web',path)
+
+
+initialize()
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=int(os.environ.get('PORT','8792')), threaded=True)

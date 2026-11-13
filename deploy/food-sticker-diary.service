@@ -1,0 +1,27 @@
+[Unit]
+Description=Food Sticker Diary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fooddiary
+Group=fooddiary
+WorkingDirectory=/srv/food-sticker-diary
+Environment=FOOD_DATA=/var/lib/food-sticker-diary
+Environment=FOOD_MODELS=/srv/food-sticker-diary/models
+Environment=FOOD_BASE=/food-diary/
+Environment=FOOD_COOKIE_SECURE=1
+ExecStart=/srv/food-sticker-diary/.venv/bin/waitress-serve --listen=127.0.0.1:8792 --threads=4 app:app
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/food-sticker-diary
+MemoryMax=1G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
