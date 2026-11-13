@@ -53,3 +53,51 @@
 @keyframes scan-beam{from{transform:translateY(0)}to{transform:translateY(min(23dvh,155px))}}
 
 .weight-chart{display:block;width:100%;height:120px;margin-top:12px}.chart-dates{display:flex;justify-content:space-between;color:#686862;font-size:12px;line-height:16px}
+
+/* A share is a small food diary that can travel on its own. */
+.share-page{min-height:100vh;padding:16px 16px 28px;background:#f1ece5;color:#292722}
+.share-poster{background:#fffcf7;border-radius:16px;padding:24px;box-shadow:0 8px 28px #4b362210}
+.poster-brand{display:flex;align-items:center;gap:8px;min-width:0;color:#33302b}
+.poster-brand img{width:32px;height:32px;border-radius:9px;flex:none}
+.poster-brand strong{font-size:14px;white-space:nowrap}
+.poster-brand span{margin-left:auto;color:#796e61;font-size:12px;text-align:right}
+.poster-intro{margin:32px 0 20px}
+.poster-intro h1{font-size:24px;line-height:32px;font-weight:700;letter-spacing:-.02em;margin:0;overflow-wrap:anywhere;text-wrap:balance}
+.poster-intro p{margin:8px 0 0;color:#8a4b37;font-size:14px;line-height:20px}
+.poster-summary{display:flex;align-items:center;justify-content:space-between;gap:16px;border-top:1px solid #e7ded3;border-bottom:1px solid #e7ded3;padding:16px 0}
+.poster-total{display:flex;flex-direction:column;gap:4px;flex:none}
+.poster-total>span,.poster-macros span{font-size:12px;color:#776d61}
+.poster-total strong{color:#e84628;font-size:24px;line-height:28px;font-variant-numeric:tabular-nums}
+.poster-total small{color:#a23b26;font-size:12px;font-weight:600}
+.poster-macros{display:flex;justify-content:flex-end;gap:16px;min-width:0}
+.poster-macros div{display:flex;flex-direction:column;gap:5px;min-width:0}
+.poster-macros strong{font-size:14px;font-weight:650;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.poster-macros small{font-size:12px;font-weight:400}
+.poster-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:28px 0 14px}
+.poster-section-head h2{margin:0;font-size:18px;line-height:28px}
+.poster-section-head span{font-size:12px;color:#776d61}
+.share-poster .sticker-grid{gap:10px}
+.share-poster .sticker-card{background:#f5f0e8;border-radius:12px;padding:12px;text-align:left}
+.share-poster .sticker-card:nth-child(4n+2),.share-poster .sticker-card:nth-child(4n+3){background:#f8eee7}
+.share-poster .sticker-card button{text-align:left}
+.share-poster .sticker-card img,.share-poster .sticker-card .empty-thumb{height:138px;margin:4px auto 0}
+.share-poster .sticker-card .empty-thumb{background:#ede5da}
+.share-poster .sticker-card strong{margin-top:8px;line-height:20px;white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;min-height:20px}
+.share-poster .sticker-card small{color:#6f6256;line-height:16px}
+.poster-meal-type{display:block;color:#865b4a;font-size:12px;line-height:16px}
+.poster-footer{border-top:1px solid #e7ded3;margin-top:28px;padding-top:20px}
+.poster-promo{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.poster-promo>div:first-child{min-width:0}
+.poster-promo strong{display:block;font-size:16px;line-height:24px;text-wrap:balance}
+.poster-promo p{margin:6px 0 0;color:#776d61;font-size:12px;line-height:20px}
+.poster-qr-caption:not([hidden]){display:block;margin-top:10px;color:#9c3c25;font-size:12px}
+.poster-qr{width:96px;height:96px;flex:none;background:#fff}
+.poster-qr[hidden]{display:none}
+.poster-qr svg{display:block;width:100%;height:100%;shape-rendering:crispEdges}
+.poster-privacy{margin:20px 0 0;color:#776d61;font-size:12px;line-height:20px}
+.poster-open{margin-top:16px}
+.poster-unavailable{padding:48px 0 32px;text-align:center}
+.poster-unavailable .icon{width:32px;height:32px;color:#a68875}
+.poster-unavailable h1{margin:16px 0 8px;font-size:20px;line-height:28px}
+.poster-unavailable p{margin:0;color:#776d61;font-size:14px;line-height:20px}
+@media(max-width:360px){.share-poster{padding:20px}.poster-brand span{display:none}.poster-summary{align-items:flex-start;flex-wrap:wrap}.poster-macros{justify-content:flex-start}.share-poster .sticker-card img,.share-poster .sticker-card .empty-thumb{height:112px}}
