@@ -254,6 +254,37 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.delete('/api/weights/2026-11-13').status_code,200)
         self.assertEqual(self.alice.get('/api/weights').json['weights'],[])
 
+    def test_meal_record_time_is_optional_editable_and_consistent_in_shares(self):
+        meal={'day':'2026-11-13','category':'breakfast','name':'早餐','calories':100}
+        old=self.alice.post('/api/meals',json=meal).json['meal']
+        self.assertIsNone(old['record_time'])
+        early=self.alice.post('/api/meals',json=meal|{'name':'早些','record_time':'08:15'}).json['meal']
+        late=self.alice.post('/api/meals',json=meal|{'name':'晚些','record_time':'09:40'}).json['meal']
+        for invalid in ('24:00','9:30','12:60','23:59:00','1８:00',123,[],{},False):
+            self.assertEqual(self.alice.post('/api/meals',json=meal|{'record_time':invalid}).status_code,400)
+        self.assertEqual(self.bob.put(f"/api/meals/{early['id']}",json=meal|{'record_time':'12:00'}).status_code,404)
+        # Older clients omit the new field and must not erase it on update.
+        unchanged=self.alice.put(f"/api/meals/{early['id']}",json=meal|{'name':'早些更新'}).json['meal']
+        self.assertEqual(unchanged['record_time'],'08:15')
+        changed=self.alice.put(f"/api/meals/{late['id']}",json=meal|{'name':'更早','record_time':'07:00'}).json['meal']
+        self.assertEqual(changed['record_time'],'07:00')
+        expected=[early['id'],late['id'],old['id']]
+        own=self.alice.get('/api/meals?day=2026-11-13').json['meals']
+        self.assertEqual([item['id'] for item in own],expected)
+        invite=self.alice.post('/api/buddy/invites',json={}).json['token']
+        self.bob.post('/api/buddy/accept',json={'token':invite})
+        buddy=self.bob.get('/api/buddy?day=2026-11-13').json['meals']
+        self.assertEqual([item['id'] for item in buddy],expected)
+        self.assertEqual(buddy[0]['record_time'],'08:15')
+        share=self.alice.post('/api/shares',json={'day':'2026-11-13'}).json['shares'][0]
+        shared=self.visitor.get(f"/api/shared/{share['token']}").json['meals']
+        self.assertEqual([item['id'] for item in shared],expected)
+        self.assertEqual(shared[0]['record_time'],'08:15')
+        self.alice.put('/api/buddy/sharing',json={'enabled':False})
+        self.assertEqual(self.bob.get('/api/buddy?day=2026-11-13').json['meals'],[])
+        cleared=self.alice.put(f"/api/meals/{early['id']}",json=meal|{'record_time':''}).json['meal']
+        self.assertIsNone(cleared['record_time'])
+
     def test_photo_save_keeps_disk_reserve(self):
         from types import SimpleNamespace
         data={'day':'2026-11-13','category':'lunch','name':'测试','calories':100,'photo':photo_data()}
@@ -352,6 +383,7 @@ class DiaryTest(unittest.TestCase):
             conn=sqlite3.connect(os.path.join(directory,'diary.sqlite3'))
             self.assertEqual(conn.execute("SELECT name,calories,components FROM meals WHERE id='old'").fetchone(),('旧记录',123.0,'[]'))
             self.assertEqual(conn.execute("SELECT sticker_border,sticker_color,sticker_rendered FROM meals WHERE id='old'").fetchone(),(0,'#ffffff',None))
+            self.assertIsNone(conn.execute("SELECT record_time FROM meals WHERE id='old'").fetchone()[0])
             self.assertEqual(conn.execute("SELECT username,target,carbs_goal,protein_goal,fat_goal FROM users WHERE id=1").fetchone(),('legacy',1900,None,None,None))
             self.assertIsNone(conn.execute("SELECT meal_split FROM users WHERE id=1").fetchone()[0])
             self.assertEqual(conn.execute("SELECT provider,model,api_key FROM provider_settings WHERE user_id=2").fetchone(),('deepseek','old-model','encrypted-old-key'))

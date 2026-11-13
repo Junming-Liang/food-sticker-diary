@@ -91,7 +91,7 @@ def initialize():
             id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             day TEXT NOT NULL, category TEXT NOT NULL, name TEXT NOT NULL,
             grams REAL NOT NULL, calories REAL NOT NULL, carbs REAL NOT NULL, protein REAL NOT NULL, fat REAL NOT NULL,
-            image TEXT, sticker TEXT, created INTEGER NOT NULL,
+            image TEXT, sticker TEXT, created INTEGER NOT NULL, record_time TEXT,
             components TEXT NOT NULL DEFAULT '[]', sticker_rendered TEXT,
             sticker_border INTEGER NOT NULL DEFAULT 0, sticker_color TEXT NOT NULL DEFAULT '#ffffff'
         );
@@ -148,7 +148,7 @@ def initialize():
         if 'components' not in columns:
             db().execute("ALTER TABLE meals ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
         for name,definition in (('sticker_rendered','TEXT'),('sticker_border','INTEGER NOT NULL DEFAULT 0'),
-                                ('sticker_color',"TEXT NOT NULL DEFAULT '#ffffff'")):
+                                ('sticker_color',"TEXT NOT NULL DEFAULT '#ffffff'"),('record_time','TEXT')):
             if name not in columns: db().execute(f'ALTER TABLE meals ADD COLUMN {name} {definition}')
         user_columns={row['name'] for row in db().execute('PRAGMA table_info(users)').fetchall()}
         for name in ('carbs_goal','protein_goal','fat_goal'):
@@ -542,6 +542,14 @@ def meal_fields(data):
     return [day, category, name, *values]
 
 
+def meal_record_time(data, default=None):
+    value=data.get('record_time',default)
+    if value in (None,''): return None
+    if not isinstance(value,str) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]',value):
+        raise ValueError('请选择有效的记录时间')
+    return value
+
+
 def meal_payload(data):
     components=data.get('components',[])
     if not isinstance(components,list) or len(components)>12:
@@ -630,10 +638,13 @@ def remove_image(user_id, name):
 
 
 def meal_json(row, shared=False):
-    return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created')} | {
+    return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created','record_time')} | {
         'has_photo':bool(row['image']) and not shared, 'has_sticker':bool(row['sticker']),
         'sticker_border':row['sticker_border'], 'sticker_color':row['sticker_color'],
         'components':json.loads(row['components'])}
+
+
+MEAL_ORDER = 'day DESC, record_time IS NULL, record_time DESC, created DESC, id DESC'
 
 
 @app.get('/api/meals')
@@ -643,7 +654,7 @@ def meals():
     if valid_day(day): start = end = day
     if not valid_day(start) or not valid_day(end) or start>end:
         return jsonify(error='请选择有效的日期范围'), 400
-    rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day BETWEEN ? AND ? ORDER BY day DESC,created DESC',
+    rows = db().execute(f'SELECT * FROM meals WHERE user_id=? AND day BETWEEN ? AND ? ORDER BY {MEAL_ORDER}',
                         (g.user['id'],start,end)).fetchall()
     return jsonify(meals=[meal_json(row) for row in rows])
 
@@ -653,7 +664,7 @@ def meals():
 @serialized_images
 def create_meal():
     data = body()
-    try: fields,components = meal_payload(data)
+    try: fields,components = meal_payload(data);record_time=meal_record_time(data)
     except ValueError as exc: return jsonify(error=str(exc)), 400
     photo = sticker = None
     try:
@@ -661,9 +672,9 @@ def create_meal():
         sticker = save_image(data.get('sticker'),g.user['id'],'sticker')
         mid = secrets.token_hex(16)
         db().execute('''INSERT INTO meals
-            (id,user_id,day,category,name,grams,calories,carbs,protein,fat,image,sticker,created,components)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-            (mid,g.user['id'],*fields,photo,sticker,int(time.time()),json.dumps(components,ensure_ascii=False)))
+            (id,user_id,day,category,name,grams,calories,carbs,protein,fat,image,sticker,created,components,record_time)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (mid,g.user['id'],*fields,photo,sticker,int(time.time()),json.dumps(components,ensure_ascii=False),record_time))
         now=int(time.time())
         db().execute('''INSERT INTO push_outbox(subscription_id,meal_id,created,next_attempt)
             SELECT s.id,?,?,? FROM buddy_members mine
@@ -687,10 +698,10 @@ def update_meal(mid):
     data=body()
     if 'components' not in data and json.loads(row['components']):
         return jsonify(error='此记录含有食物明细，请刷新页面后再编辑'),409
-    try: fields,components = meal_payload(data)
+    try: fields,components = meal_payload(data);record_time=meal_record_time(data,row['record_time'])
     except ValueError as exc: return jsonify(error=str(exc)), 400
-    db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?,components=?
-                    WHERE id=? AND user_id=?''', (*fields,json.dumps(components,ensure_ascii=False),mid,g.user['id'])); db().commit()
+    db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?,components=?,record_time=?
+                    WHERE id=? AND user_id=?''', (*fields,json.dumps(components,ensure_ascii=False),record_time,mid,g.user['id'])); db().commit()
     return jsonify(meal=meal_json(db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()))
 
 
@@ -811,7 +822,7 @@ def buddy():
               'other_sharing':bool(other['sharing']), 'target':other['target'] if other['sharing'] else None,
               'meal_split':json.loads(other['meal_split']) if other['sharing'] and other['meal_split'] else None, 'meals':[]}
     if other['sharing']:
-        rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
+        rows = db().execute(f'SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY {MEAL_ORDER}',
                             (other['user_id'],day)).fetchall()
         result['meals'] = [meal_json(row, shared=True) for row in rows]
     return jsonify(result)
@@ -1051,7 +1062,7 @@ def shared(token):
     share = shared_row(token)
     if not share: return jsonify(error='分享链接无效或已过期'),404
     user = db().execute('SELECT username FROM users WHERE id=?', (share['user_id'],)).fetchone()
-    rows = db().execute('SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY created DESC',
+    rows = db().execute(f'SELECT * FROM meals WHERE user_id=? AND day=? ORDER BY {MEAL_ORDER}',
                         (share['user_id'],share['day'])).fetchall()
     return jsonify(owner=user['username'],day=share['day'],meals=[meal_json(row, shared=True) for row in rows],expires=share['expires'])
 
