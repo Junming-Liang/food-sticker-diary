@@ -29,6 +29,129 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.post('/api/auth/register',json={'username':'alice'+suffix,'password':'long-password'}).status_code,200)
         self.assertEqual(self.bob.post('/api/auth/register',json={'username':'bob'+suffix,'password':'long-password'}).status_code,200)
 
+    def test_frequent_food_is_private_persistent_and_uses_small_sticker(self):
+        image=Image.new('RGBA',(640,480),(44,33,22,0));image.paste((230,60,10,255),(100,100,500,380))
+        stream=io.BytesIO();image.save(stream,'PNG')
+        sticker='data:image/png;base64,'+base64.b64encode(stream.getvalue()).decode()
+        base={'day':'2026-11-13','category':'lunch','name':'螺蛳粉','grams':200,'calories':300,'protein':12,'sticker':sticker}
+        ids=[]
+        for count in range(2):
+            response=self.alice.post('/api/meals',json=base|{'grams':200+count*50,'calories':300+count*40})
+            self.assertEqual(response.status_code,201);ids.append(response.json['meal']['id'])
+        self.assertEqual(self.alice.post('/api/frequent-foods/sync').json['foods'],[])
+        response=self.alice.post('/api/meals',json=base|{'grams':300,'calories':380})
+        ids.append(response.json['meal']['id'])
+        # The third save materializes the entry even before its first list view.
+        user_id=self.alice.get('/api/me').json['user']['id']
+        with application.app.app_context():
+            self.assertEqual(application.db().execute('SELECT COUNT(*) FROM frequent_foods WHERE user_id=?',(user_id,)).fetchone()[0],1)
+        result=self.alice.post('/api/frequent-foods/sync').json
+        self.assertEqual(len(result['foods']),1)
+        food=result['foods'][0];self.assertEqual((food['name'],food['grams'],food['calories']),('螺蛳粉',300,380))
+        self.assertTrue(food['has_sticker'])
+        self.assertEqual(self.alice.put(f'/api/meals/{ids[-1]}',json=base|{'grams':300,'calories':420}).status_code,200)
+        food=self.alice.post('/api/frequent-foods/sync').json['foods'][0]
+        self.assertEqual(food['calories'],420)
+        self.assertEqual(len(list((application.UPLOADS/str(user_id)).glob('frequent-*.png'))),1)
+        url=f"/api/frequent-foods/{food['id']}/sticker"
+        response=self.alice.get(url);self.assertEqual(response.status_code,200)
+        etag=response.headers['ETag'];small=Image.open(io.BytesIO(response.data)).convert('RGBA')
+        self.assertEqual(small.size,(160,120));self.assertEqual(small.getpixel((0,0)),(0,0,0,0));response.close()
+        self.assertEqual(self.bob.post('/api/frequent-foods/sync').json['foods'],[])
+        self.assertEqual(self.bob.get(url,headers={'If-None-Match':etag}).status_code,404)
+        self.assertEqual(self.visitor.get(url).status_code,401)
+        self.assertEqual(self.bob.delete(f"/api/frequent-foods/{food['id']}").status_code,404)
+        for mid in ids:self.assertEqual(self.alice.delete(f'/api/meals/{mid}').status_code,200)
+        stored=self.alice.post('/api/frequent-foods/sync').json['foods']
+        self.assertEqual(len(stored),1);self.assertEqual(stored[0]['calories'],420)
+        response=self.alice.get(url);self.assertEqual(response.status_code,200);response.close()
+        self.assertEqual(self.alice.delete(f"/api/frequent-foods/{food['id']}").status_code,200)
+        self.assertEqual(self.alice.get(url,headers={'If-None-Match':etag}).status_code,404)
+
+    def test_frequent_food_backfills_before_deleting_legacy_record(self):
+        meal={'day':'2026-11-13','category':'lunch','name':'旧记录的面','grams':200,'calories':360,'sticker':photo_data('RGBA')}
+        with patch.object(application,'sync_meal_foods'):
+            ids=[self.alice.post('/api/meals',json=meal).json['meal']['id'] for _ in range(3)]
+        user_id=self.alice.get('/api/me').json['user']['id']
+        with application.app.app_context():
+            self.assertEqual(application.db().execute('SELECT COUNT(*) FROM frequent_foods WHERE user_id=?',(user_id,)).fetchone()[0],0)
+        for mid in ids:self.assertEqual(self.alice.delete(f'/api/meals/{mid}').status_code,200)
+        foods=self.alice.post('/api/frequent-foods/sync').json['foods']
+        self.assertEqual(len(foods),1);self.assertEqual(foods[0]['name'],'旧记录的面');self.assertTrue(foods[0]['has_sticker'])
+
+    def test_frequent_food_components_deduplicate_and_hide_restore(self):
+        items=[{'name':'鸡蛋','grams':30,'calories':40},{'name':'鸡蛋','grams':20,'calories':30},
+               {'name':'米饭','grams':100,'calories':130}]
+        payload={'day':'2026-11-13','category':'lunch','name':'盖浇饭','components':items,'sticker':photo_data('RGBA')}
+        for _ in range(2):self.alice.post('/api/meals',json=payload)
+        self.assertEqual(self.alice.post('/api/frequent-foods/sync').json['foods'],[])
+        self.alice.post('/api/meals',json=payload)
+        foods={food['name']:food for food in self.alice.post('/api/frequent-foods/sync').json['foods']}
+        self.assertEqual(set(foods),{'盖浇饭','鸡蛋','米饭'})
+        self.assertEqual((foods['鸡蛋']['grams'],foods['鸡蛋']['calories']),(50,70))
+        self.assertFalse(foods['鸡蛋']['has_sticker']);self.assertFalse(foods['米饭']['has_sticker'])
+        self.assertTrue(foods['盖浇饭']['has_sticker'])
+        fid=foods['鸡蛋']['id']
+        self.alice.delete(f'/api/frequent-foods/{fid}')
+        result=self.alice.post('/api/frequent-foods/sync').json
+        self.assertEqual(result['hidden'],1);self.assertNotIn('鸡蛋',[item['name'] for item in result['foods']])
+        self.alice.post('/api/meals',json=payload)
+        self.assertNotIn('鸡蛋',[item['name'] for item in self.alice.post('/api/frequent-foods/sync').json['foods']])
+        result=self.alice.post('/api/frequent-foods/restore').json
+        self.assertEqual(result['hidden'],0);self.assertIn('鸡蛋',[item['name'] for item in result['foods']])
+
+    def test_frequent_food_matches_normalized_names_and_retries_sticker_after_quota(self):
+        base={'day':'2026-11-13','category':'breakfast','grams':100,'calories':100,'sticker':photo_data('RGBA')}
+        real_write=application.write_image
+        def fail_frequent(user_id,path,content):
+            if path.name.startswith('frequent-'):raise application.StorageLimitError('no space')
+            return real_write(user_id,path,content)
+        with patch.object(application,'write_image',side_effect=fail_frequent):
+            for name in ('OAT　MILK','oat milk',' Oat   Milk '):
+                self.assertEqual(self.alice.post('/api/meals',json=base|{'name':name}).status_code,201)
+            result=self.alice.post('/api/frequent-foods/sync').json
+            self.assertEqual(len(result['foods']),1);self.assertFalse(result['foods'][0]['has_sticker'])
+            self.assertTrue(result['sticker_pending'])
+        result=self.alice.post('/api/frequent-foods/sync').json
+        self.assertEqual(len(result['foods']),1);self.assertTrue(result['foods'][0]['has_sticker'])
+        self.assertFalse(result['sticker_pending'])
+
+    def test_frequent_food_falls_back_from_bad_preview_and_cleans_only_orphans(self):
+        meal={'day':'2026-11-13','category':'lunch','name':'小米粥','grams':200,'calories':120,'sticker':photo_data('RGBA')}
+        with patch.object(application,'sync_meal_foods'):
+            ids=[self.alice.post('/api/meals',json=meal).json['meal']['id'] for _ in range(3)]
+        user_id=self.alice.get('/api/me').json['user']['id'];folder=application.UPLOADS/str(user_id)
+        with application.app.app_context():
+            source=application.db().execute('SELECT sticker FROM meals WHERE id=?',(ids[-1],)).fetchone()['sticker']
+        (folder/(source+'.small')).write_bytes(b'invalid preview')
+        result=self.alice.post('/api/frequent-foods/sync').json
+        self.assertTrue(result['foods'][0]['has_sticker'])
+        kept=folder/result['foods'][0]['sticker_version']
+        stale=folder/('frequent-'+'a'*32+'.png');fresh=folder/('frequent-'+'b'*32+'.png');unrelated=folder/'other.png'
+        for path in (stale,fresh,unrelated):path.write_bytes(b'test')
+        old=time.time()-90000
+        for path in (stale,kept,unrelated):os.utime(path,(old,old))
+        application._image_usage['scanned']=0
+        self.alice.post('/api/frequent-foods/sync')
+        self.assertFalse(stale.exists());self.assertTrue(fresh.exists());self.assertTrue(kept.exists());self.assertTrue(unrelated.exists())
+
+    def test_frequent_snapshot_failure_does_not_leave_files_or_modify_meals(self):
+        meal={'day':'2026-11-13','category':'lunch','name':'番茄面','grams':200,'calories':300,'sticker':photo_data('RGBA')}
+        with patch.object(application,'sync_meal_foods'):
+            ids=[self.alice.post('/api/meals',json=meal).json['meal']['id'] for _ in range(3)]
+        user_id=self.alice.get('/api/me').json['user']['id'];folder=application.UPLOADS/str(user_id)
+        with application.app.app_context():
+            connection=application.db()
+            class FailingCommit:
+                def __getattr__(self,name):return getattr(connection,name)
+                def commit(self):raise OSError('simulated database failure')
+            with patch.object(application,'db',return_value=FailingCommit()):
+                with self.assertRaises(OSError):application.sync_frequent_foods(user_id)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM frequent_foods WHERE user_id=?',(user_id,)).fetchone()[0],0)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM meals WHERE user_id=?',(user_id,)).fetchone()[0],3)
+        self.assertEqual(list(folder.glob('frequent-*.png')),[])
+        self.assertEqual(len(ids),3)
+
     def test_private_meal_share_and_revoke(self):
         meal = {'day':'2026-11-13','category':'lunch','name':'测试餐','grams':200,'calories':350,
                 'carbs':30,'protein':20,'fat':10,'photo':photo_data(),'sticker':photo_data('RGBA')}

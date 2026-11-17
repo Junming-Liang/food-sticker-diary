@@ -476,6 +476,60 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await owner.getByRole('button',{name:'结束本次计时'}).click();
     await owner.getByRole('button',{name:'结束计时',exact:true}).click();
     await owner.getByText(/实际 00:00/).waitFor();
+
+    const favoriteName='番茄鸡蛋面',longFavorite='很长的食物名称'.repeat(10);
+    await owner.evaluate(async ({day,photo,favoriteName,longFavorite})=>{
+      for(const name of [favoriteName,longFavorite])for(let i=0;i<3;i++){
+        const response=await fetch('api/meals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day,category:'lunch',name,grams:150,calories:270,carbs:40,protein:12,fat:6,sticker:photo.png})});
+        if(!response.ok)throw new Error('Could not create frequent-food test meal');
+      }
+    },{day,photo,favoriteName,longFavorite});
+    let recognitionCalls=0;
+    await owner.route('**/api/analyze',async route=>{recognitionCalls++;await route.abort()});
+    await owner.getByRole('button',{name:'记录',exact:true}).click();
+    await owner.getByRole('button',{name:'添加饮食记录'}).click();
+    await owner.getByRole('button',{name:/常吃的食物/}).click();
+    const frequentRow=owner.locator('.frequent-row').filter({hasText:favoriteName});
+    await frequentRow.getByText(favoriteName).waitFor();
+    await owner.setViewportSize({width:320,height:700});
+    assert.equal(await owner.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await owner.locator('#frequent-search').fill(favoriteName);
+    assert.equal(await owner.locator('.frequent-row').count(),1);
+    await frequentRow.locator('[data-action=choose-frequent]').click();
+    assert.equal(await owner.locator('#meal-form [name=name]').inputValue(),favoriteName);
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'270');
+    await owner.locator('#meal-form [name=grams]').fill('300');
+    assert.equal(await owner.locator('#meal-form [name=calories]').inputValue(),'540');
+    await owner.locator('dialog .preview img').waitFor();
+    await owner.getByRole('button',{name:'保存记录'}).click();
+    await owner.getByText('已保存饮食记录').waitFor();
+    assert.equal(recognitionCalls,0);
+    const reused=await owner.evaluate(async ({day,favoriteName})=>{
+      const data=await (await fetch(`api/meals?day=${day}`)).json();
+      const meal=data.meals.find(item=>item.name===favoriteName&&item.grams===300);
+      const blob=await (await fetch(`api/meals/${meal.id}/sticker`)).blob();
+      const image=await createImageBitmap(blob);return {meal,width:image.width,height:image.height};
+    },{day,favoriteName});
+    assert.equal(reused.meal.calories,540);assert.equal(reused.meal.has_photo,false);
+    assert.ok(reused.width<=160&&reused.height<=160);
+    const otherFoods=await buddy.evaluate(async()=>await (await fetch('api/frequent-foods/sync',{method:'POST'})).json());
+    assert.equal(otherFoods.foods.some(item=>item.name==='番茄鸡蛋面'),false);
+
+    await owner.getByRole('button',{name:'添加饮食记录'}).click();
+    await owner.getByRole('button',{name:/常吃的食物/}).click();
+    await frequentRow.locator('[data-action=confirm-remove-frequent]').click();
+    await owner.getByRole('button',{name:'确认移除'}).click();
+    await owner.getByText('已移除常吃食物').waitFor();
+    assert.equal(await owner.locator('.frequent-row').filter({hasText:favoriteName}).count(),0);
+    await owner.getByRole('button',{name:/恢复已移除的自动收录/}).click();
+    await frequentRow.getByText(favoriteName).waitFor();
+    await frequentRow.locator('[data-action=choose-frequent]').click();
+    await owner.getByRole('button',{name:'从食物库选择'}).click();
+    await owner.locator('#food-search').fill('白米');
+    await owner.locator('dialog').getByRole('button',{name:/白米饭/}).click();
+    assert.equal(await owner.locator('dialog .preview img').count(),0);
+    await owner.getByRole('button',{name:'关闭'}).click();
+    await owner.unroute('**/api/analyze');
     assert.deepEqual(errors, []);
     console.log('Mobile browser smoke test passed.');
   } finally {

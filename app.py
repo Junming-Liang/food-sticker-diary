@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import time
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
@@ -67,7 +68,7 @@ def image_usage():
                 try:
                     path=os.path.join(root,name);item=os.stat(path,follow_symlinks=False)
                     if not stat.S_ISREG(item.st_mode): continue
-                    if re.fullmatch(r'(?:avatar\.jpg|[a-f0-9]{32}\.(?:jpg|png)(?:\.(?:thumb|small)(?:\.webp)?)?)\.[a-f0-9]{16}\.tmp',name) and item.st_mtime<time.time()-86400:
+                    if re.fullmatch(r'(?:avatar\.jpg|frequent-[a-f0-9]{32}\.png|[a-f0-9]{32}\.(?:jpg|png)(?:\.(?:thumb|small)(?:\.webp)?)?)\.[a-f0-9]{16}\.tmp',name) and item.st_mtime<time.time()-86400:
                         try: os.unlink(path);continue
                         except OSError: pass
                     amount+=item.st_size
@@ -170,6 +171,18 @@ def initialize():
             sticker_border INTEGER NOT NULL DEFAULT 0, sticker_color TEXT NOT NULL DEFAULT '#ffffff'
         );
         CREATE INDEX IF NOT EXISTS meals_user_day ON meals(user_id,day);
+        CREATE INDEX IF NOT EXISTS meals_user_created ON meals(user_id,created DESC);
+        CREATE TABLE IF NOT EXISTS frequent_foods (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            food_key TEXT NOT NULL, name TEXT NOT NULL, grams REAL NOT NULL, calories REAL NOT NULL,
+            carbs REAL NOT NULL, protein REAL NOT NULL, fat REAL NOT NULL, components TEXT NOT NULL,
+            sample_created INTEGER NOT NULL, sample_rowid INTEGER NOT NULL, sample_id TEXT NOT NULL,
+            sticker TEXT, sticker_source TEXT, UNIQUE(user_id,food_key)
+        );
+        CREATE TABLE IF NOT EXISTS frequent_exclusions (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, food_key TEXT NOT NULL,
+            PRIMARY KEY(user_id,food_key)
+        );
         CREATE TABLE IF NOT EXISTS shares (
             id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token_cipher TEXT NOT NULL,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -762,6 +775,199 @@ def remove_image(user_id, name):
             adjust_image_usage(user_id,-size)
 
 
+FOOD_NUTRIENTS = ('grams','calories','carbs','protein','fat')
+
+
+def food_key(name):
+    return ' '.join(unicodedata.normalize('NFKC',name).split()).casefold()
+
+
+def foods_in_meal(row):
+    """Count a name once per meal; a multi-food sticker belongs to the whole meal only."""
+    try: components=json.loads(row['components'])
+    except (ValueError,TypeError): components=[]
+    if not isinstance(components,list): components=[]
+    foods={}
+    for item in components:
+        if not isinstance(item,dict) or not isinstance(item.get('name'),str): continue
+        key=food_key(item['name'])
+        if not key: continue
+        try: values={field:float(item.get(field) or 0) for field in FOOD_NUTRIENTS}
+        except (TypeError,ValueError): continue
+        if any(not 0<=value<=100000 for value in values.values()): continue
+        if key not in foods:
+            foods[key]={'name':item['name'],'components':[],'sticker_source':None,**{k:0 for k in FOOD_NUTRIENTS}}
+        for field in FOOD_NUTRIENTS:
+            foods[key][field]=round(foods[key][field]+values[field],1)
+    key=food_key(row['name'])
+    if key and key!=food_key('一份餐食') and (key not in foods or len(components)==1):
+        foods[key]={'name':row['name'],'components':components,
+                    'sticker_source':row['sticker_rendered'] or row['sticker'],
+                    **{field:row[field] for field in FOOD_NUTRIENTS}}
+    return foods
+
+
+def frequent_thumbnail(user_id, source):
+    path=UPLOADS / str(user_id) / Path(source).name
+    if not path.is_file(): return None
+    # Existing small previews avoid decoding the full sticker again.
+    for candidate in (path.with_name(path.name+'.small'),path.with_name(path.name+'.small.webp'),path):
+        if not candidate.is_file(): continue
+        try:
+            with Image.open(candidate) as image:
+                return thumbnail_bytes(image,'sticker',edge=160)
+        except (OSError,ValueError,Image.DecompressionBombError): continue
+    return None
+
+
+def sync_frequent_foods(user_id, keys=None):
+    """Save qualified foods independently, with at most one small sticker each."""
+    if keys is not None and not keys: return False
+    with _image_lock:
+        connection=db()
+        existing={row['food_key']:row for row in connection.execute('SELECT * FROM frequent_foods WHERE user_id=?',(user_id,))}
+        excluded={row['food_key'] for row in connection.execute('SELECT food_key FROM frequent_exclusions WHERE user_id=?',(user_id,))}
+        found={}
+        for row in connection.execute('SELECT rowid AS sample_rowid,* FROM meals WHERE user_id=? ORDER BY created DESC,rowid DESC',(user_id,)):
+            for key,food in foods_in_meal(row).items():
+                if key in excluded or (keys is not None and key not in keys): continue
+                if key not in found:
+                    found[key]={'count':0,'food':food,'created':row['created'],'rowid':row['sample_rowid'],
+                                'meal_id':row['id'],'sticker_source':None}
+                entry=found[key];entry['count']+=1
+                source=food['sticker_source']
+                if not entry['sticker_source'] and source and (UPLOADS/str(user_id)/Path(source).name).is_file():
+                    entry['sticker_source']=source
+        new_files=[];old_files=[];sticker_pending=False
+        try:
+            for key,entry in found.items():
+                previous=existing.get(key)
+                if not previous and entry['count']<3: continue
+                newer=not previous or (entry['created'],entry['rowid']) >= (previous['sample_created'],previous['sample_rowid'])
+                food=entry['food'] if newer else None
+                fid=previous['id'] if previous else secrets.token_hex(16)
+                sticker=previous['sticker'] if previous else None
+                sticker_source=previous['sticker_source'] if previous else None
+                if sticker and not (UPLOADS/str(user_id)/Path(sticker).name).is_file(): sticker=None;sticker_source=None
+                source=entry['sticker_source']
+                if source and (not sticker or (newer and source!=sticker_source)):
+                    try:
+                        content=frequent_thumbnail(user_id,source)
+                        if content:
+                            filename='frequent-'+secrets.token_hex(16)+'.png'
+                            folder=UPLOADS/str(user_id);folder.mkdir(exist_ok=True,mode=0o700)
+                            write_image(user_id,folder/filename,content);new_files.append(filename)
+                            if sticker: old_files.append(sticker)
+                            sticker=filename;sticker_source=source
+                        else: sticker_pending=True
+                    except (OSError,ValueError,Image.DecompressionBombError):
+                        sticker_pending=True
+                if previous:
+                    if food:
+                        values=(food['name'],*(food[k] for k in FOOD_NUTRIENTS),json.dumps(food['components'],ensure_ascii=False),
+                                entry['created'],entry['rowid'],entry['meal_id'],sticker,sticker_source)
+                        fields=('name',*FOOD_NUTRIENTS,'components','sample_created','sample_rowid','sample_id','sticker','sticker_source')
+                        if values!=tuple(previous[field] for field in fields):
+                            connection.execute('''UPDATE frequent_foods SET name=?,grams=?,calories=?,carbs=?,protein=?,fat=?,
+                                components=?,sample_created=?,sample_rowid=?,sample_id=?,sticker=?,sticker_source=? WHERE id=? AND user_id=?''',
+                                (*values,fid,user_id))
+                    elif sticker!=previous['sticker'] or sticker_source!=previous['sticker_source']:
+                        connection.execute('UPDATE frequent_foods SET sticker=?,sticker_source=? WHERE id=? AND user_id=?',
+                                           (sticker,sticker_source,fid,user_id))
+                else:
+                    connection.execute('''INSERT INTO frequent_foods
+                        (id,user_id,food_key,name,grams,calories,carbs,protein,fat,components,sample_created,sample_rowid,sample_id,sticker,sticker_source)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (fid,user_id,key,food['name'],*(food[k] for k in FOOD_NUTRIENTS),json.dumps(food['components'],ensure_ascii=False),
+                         entry['created'],entry['rowid'],entry['meal_id'],sticker,sticker_source))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            for name in new_files:
+                try: remove_image(user_id,name)
+                except OSError: app.logger.warning('Could not remove a temporary frequent-food sticker')
+            raise
+        for name in old_files:
+            try: remove_image(user_id,name)
+            except OSError: app.logger.warning('Could not remove an old frequent-food sticker')
+        return sticker_pending
+
+
+def frequent_json(row):
+    return {key:row[key] for key in ('id','name',*FOOD_NUTRIENTS)} | {
+        'components':json.loads(row['components']),'has_sticker':bool(row['sticker']),
+        'sticker_version':row['sticker']}
+
+
+def frequent_result(user_id, sticker_pending=False):
+    rows=db().execute('SELECT * FROM frequent_foods WHERE user_id=? ORDER BY sample_created DESC,sample_rowid DESC,name',
+                      (user_id,)).fetchall()
+    hidden=db().execute('SELECT COUNT(*) FROM frequent_exclusions WHERE user_id=?',(user_id,)).fetchone()[0]
+    return jsonify(foods=[frequent_json(row) for row in rows],hidden=hidden,sticker_pending=sticker_pending)
+
+
+def cleanup_frequent_orphans(user_id):
+    folder=UPLOADS/str(user_id)
+    if not folder.is_dir(): return
+    referenced={row['sticker'] for row in db().execute('SELECT sticker FROM frequent_foods WHERE user_id=? AND sticker IS NOT NULL',(user_id,))}
+    for item in os.scandir(folder):
+        try:
+            if (re.fullmatch(r'frequent-[a-f0-9]{32}\.png',item.name) and item.name not in referenced
+                    and item.is_file(follow_symlinks=False) and item.stat(follow_symlinks=False).st_mtime<time.time()-86400):
+                remove_image(user_id,item.name)
+        except FileNotFoundError: pass
+        except OSError: app.logger.warning('Could not remove an orphan frequent-food sticker')
+
+
+def sync_meal_foods(user_id, meal_id):
+    row=db().execute('SELECT rowid AS sample_rowid,* FROM meals WHERE id=? AND user_id=?',(meal_id,user_id)).fetchone()
+    if row:
+        try: sync_frequent_foods(user_id,set(foods_in_meal(row)))
+        except Exception as exc: app.logger.warning('Could not update frequent foods: %s',type(exc).__name__)
+
+
+@app.post('/api/frequent-foods/sync')
+@auth
+@serialized_images
+def frequent_foods():
+    pending=sync_frequent_foods(g.user['id'])
+    cleanup_frequent_orphans(g.user['id'])
+    return frequent_result(g.user['id'],pending)
+
+
+@app.get('/api/frequent-foods/<fid>/sticker')
+@auth
+@serialized_images
+def frequent_sticker(fid):
+    row=db().execute('SELECT sticker FROM frequent_foods WHERE id=? AND user_id=?',(fid,g.user['id'])).fetchone()
+    if not row or not row['sticker']: abort(404)
+    path=UPLOADS/str(g.user['id'])/Path(row['sticker']).name
+    if not path.is_file(): abort(404)
+    response=send_file(path,mimetype='image/png',conditional=True);g.private_thumbnail=True
+    return response
+
+
+@app.delete('/api/frequent-foods/<fid>')
+@auth
+@serialized_images
+def delete_frequent_food(fid):
+    row=db().execute('SELECT food_key,sticker FROM frequent_foods WHERE id=? AND user_id=?',(fid,g.user['id'])).fetchone()
+    if not row: abort(404)
+    db().execute('INSERT OR IGNORE INTO frequent_exclusions(user_id,food_key) VALUES (?,?)',(g.user['id'],row['food_key']))
+    db().execute('DELETE FROM frequent_foods WHERE id=? AND user_id=?',(fid,g.user['id']));db().commit()
+    try: remove_image(g.user['id'],row['sticker'])
+    except OSError: app.logger.warning('Could not remove a frequent-food sticker')
+    return frequent_result(g.user['id'])
+
+
+@app.post('/api/frequent-foods/restore')
+@auth
+@serialized_images
+def restore_frequent_foods():
+    db().execute('DELETE FROM frequent_exclusions WHERE user_id=?',(g.user['id'],));db().commit()
+    return frequent_result(g.user['id'],sync_frequent_foods(g.user['id']))
+
+
 def meal_json(row, shared=False):
     return {k:row[k] for k in ('id','day','category','name','grams','calories','carbs','protein','fat','created','record_time')} | {
         'has_photo':bool(row['image']) and not shared, 'has_sticker':bool(row['sticker']),
@@ -812,11 +1018,13 @@ def create_meal():
         if isinstance(exc, ValueError): return jsonify(error=str(exc)), 400
         raise
     row = db().execute('SELECT * FROM meals WHERE id=?', (mid,)).fetchone()
+    sync_meal_foods(g.user['id'],mid)
     return jsonify(meal=meal_json(row)), 201
 
 
 @app.put('/api/meals/<mid>')
 @auth
+@serialized_images
 def update_meal(mid):
     row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
     if not row: abort(404)
@@ -825,8 +1033,10 @@ def update_meal(mid):
         return jsonify(error='此记录含有食物明细，请刷新页面后再编辑'),409
     try: fields,components = meal_payload(data);record_time=meal_record_time(data,row['record_time'])
     except ValueError as exc: return jsonify(error=str(exc)), 400
+    sync_meal_foods(g.user['id'],mid)
     db().execute('''UPDATE meals SET day=?,category=?,name=?,grams=?,calories=?,carbs=?,protein=?,fat=?,components=?,record_time=?
                     WHERE id=? AND user_id=?''', (*fields,json.dumps(components,ensure_ascii=False),record_time,mid,g.user['id'])); db().commit()
+    sync_meal_foods(g.user['id'],mid)
     return jsonify(meal=meal_json(db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()))
 
 
@@ -836,6 +1046,7 @@ def update_meal(mid):
 def delete_meal(mid):
     row = db().execute('SELECT * FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])).fetchone()
     if not row: abort(404)
+    sync_meal_foods(g.user['id'],mid)
     db().execute('DELETE FROM meals WHERE id=? AND user_id=?', (mid,g.user['id'])); db().commit()
     remove_image(g.user['id'],row['image']); remove_image(g.user['id'],row['sticker']); remove_image(g.user['id'],row['sticker_rendered'])
     return jsonify(ok=True)
@@ -884,6 +1095,7 @@ def update_sticker_style(mid):
     finally:
         _photo_lock.release()
     remove_image(g.user['id'],row['sticker_rendered'])
+    sync_meal_foods(g.user['id'],mid)
     updated=db().execute('SELECT * FROM meals WHERE id=?',(mid,)).fetchone()
     return jsonify(meal=meal_json(updated))
 
