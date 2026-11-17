@@ -29,6 +29,122 @@ class DiaryTest(unittest.TestCase):
         self.assertEqual(self.alice.post('/api/auth/register',json={'username':'alice'+suffix,'password':'long-password'}).status_code,200)
         self.assertEqual(self.bob.post('/api/auth/register',json={'username':'bob'+suffix,'password':'long-password'}).status_code,200)
 
+    def test_nutrition_advice_requires_configuration_and_confirmation(self):
+        import ai
+        profile={'age':30,'sex':'female','height':165,'weight':60,'activity':'moderate',
+                 'goal':'other','goal_detail':'改善饮食规律','special_circumstances':'no'}
+        self.assertEqual(self.visitor.post('/api/advice/nutrition',json=profile).status_code,401)
+        self.assertEqual(self.alice.post('/api/advice/nutrition',json=profile).status_code,400)
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key','model':'deepseek-chat'})
+        with patch.object(ai,'nutrition_advice') as recommend:
+            for changes in ({'age':17},{'age':30.5},{'activity':[]},{'special_circumstances':'yes'},{'height':float('nan')},
+                            {'goal':'other','goal_detail':''}, {'goal':'fat_loss','weight':45}):
+                self.assertEqual(self.alice.post('/api/advice/nutrition',json=profile|changes).status_code,400)
+            recommend.assert_not_called()
+        recommendation={'status':'ok','calories':2000,'split':{'carbs':50,'protein':20,'fat':30},
+                        'carbs_goal':250,'protein_goal':100,'fat_goal':66.7,'explanation':'参考活动水平','tips':[]}
+        with patch.object(ai,'nutrition_advice',return_value=recommendation) as recommend:
+            response=self.alice.post('/api/advice/nutrition',json=profile)
+        self.assertEqual(response.json['recommendation'],recommendation)
+        sent,provider,key,model=recommend.call_args.args
+        self.assertEqual((provider,key,model),('deepseek','test-key','deepseek-chat'))
+        self.assertEqual(sent['goal_detail'],'改善饮食规律');self.assertNotIn('special_circumstances',sent)
+        before=self.alice.get('/api/me').json['user']
+        self.assertEqual(before['target'],1800);self.assertIsNone(before['nutrition_goal'])
+        self.assertNotIn('height',before);self.assertNotIn('age',before)
+        applied=self.alice.put('/api/settings',json={'target':2000,'carbs_goal':250,'protein_goal':100,
+            'fat_goal':66.7,'nutrition_goal':'other','nutrition_goal_detail':'改善饮食规律'}).json['user']
+        self.assertEqual((applied['target'],applied['nutrition_goal'],applied['nutrition_goal_detail']),
+                         (2000,'other','改善饮食规律'))
+        self.assertIsNone(self.bob.get('/api/me').json['user']['nutrition_goal'])
+        self.assertEqual(self.alice.put('/api/settings',json={'nutrition_goal':'fat_loss'}).json['user']['nutrition_goal_detail'],'')
+        self.assertEqual(self.alice.put('/api/settings',json={'nutrition_goal':'other','nutrition_goal_detail':''}).status_code,400)
+
+    def test_advice_models_use_existing_text_endpoints_and_validate_output(self):
+        import ai
+        profile={'screening_minimum':1400,'goal':'增肌'}
+        good={'status':'ok','calories':2000,'carbs_percent':50,'protein_percent':20,'fat_percent':30,
+              'explanation':'根据活动水平估算','tips':['正常进餐']}
+        def response(value): return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(value,ensure_ascii=False)}}]}
+        with patch.object(ai,'provider_response',return_value=response(good)) as provider:
+            result=ai.nutrition_advice(profile,'openai','key','model')
+        req=provider.call_args.args[0];payload=json.loads(req.data)
+        self.assertEqual(req.full_url,'https://api.openai.com/v1/chat/completions')
+        self.assertNotIn('max_tokens',payload);self.assertNotIn('max_completion_tokens',payload)
+        self.assertEqual((result['carbs_goal'],result['protein_goal'],result['fat_goal']),(250,100,66.7))
+        for changes in ({'calories':1000},{'calories':float('nan')},{'protein_percent':50},
+                        {'fat_percent':25},{'explanation':''}):
+            with patch.object(ai,'provider_response',return_value=response(good|changes)):
+                with self.assertRaises(ValueError): ai.nutrition_advice(profile,'deepseek','key','model')
+        with patch.object(ai,'provider_response',return_value=response({'status':'refer','reason':'请咨询营养师'})):
+            self.assertEqual(ai.nutrition_advice(profile,'deepseek','key','model')['status'],'refer')
+        idea={'name':'鸡肉饭','portion':'鸡肉 100 克、米饭一碗','calories':550,'carbs':60,'protein':35,'fat':19,'reason':'均衡搭配'}
+        with patch.object(ai,'provider_response',return_value=response({'ideas':[idea],'note':'按饥饿程度调整'})) as provider:
+            result=ai.meal_advice({'time':'18:30'},'deepseek','key','model')
+        self.assertEqual(result['ideas'][0]['name'],'鸡肉饭')
+        self.assertEqual(provider.call_args.args[0].full_url,'https://api.deepseek.com/chat/completions')
+        with patch.object(ai,'provider_response',return_value=response({'ideas':[idea|{'calories':10}]})):
+            with self.assertRaises(ValueError): ai.meal_advice({},'deepseek','key','model')
+
+    def test_meal_advice_uses_current_account_records_and_goals(self):
+        import ai
+        day=time.strftime('%Y-%m-%d',time.gmtime());when={'day':day,'time':'18:30'}
+        self.assertEqual(self.visitor.get('/api/advice/meal',query_string=when).status_code,401)
+        self.assertEqual(self.alice.post('/api/advice/meal',json=when).status_code,400)
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'test-key','target':1800,
+            'carbs_goal':200,'protein_goal':100,'fat_goal':60,'nutrition_goal':'fat_loss',
+            'meal_split':{'breakfast':25,'lunch':35,'dinner':30,'snack':10}})
+        meal={'day':day,'category':'lunch','name':'不发送这个食物名称','calories':400,'carbs':40,'protein':20,'fat':72}
+        self.assertEqual(self.alice.post('/api/meals',json=meal).status_code,201)
+        self.assertEqual(self.bob.post('/api/meals',json=meal|{'calories':999}).status_code,201)
+        self.alice.post('/api/exercises',json={'day':day,'name':'步行','minutes':30,'calories':100})
+        context=self.alice.get('/api/advice/meal',query_string=when).json['context']
+        self.assertEqual(context['meal'],'晚餐');self.assertEqual(context['meal_count'],1)
+        self.assertEqual(context['remaining'],{'calories':1500,'carbs':160,'protein':80,'fat':-12})
+        self.assertEqual(context['plan_goal'],'减脂');self.assertEqual(context['exercise_calories'],100)
+        self.assertEqual(context['meal_category_target'],540);self.assertEqual(context['meal_category_consumed'],0)
+        self.assertNotIn(meal['name'],json.dumps(context,ensure_ascii=False))
+        with patch.object(ai,'meal_advice',return_value={'ideas':[],'note':''}) as recommend:
+            response=self.alice.post('/api/advice/meal',json=when)
+        self.assertEqual(response.status_code,200);self.assertEqual(recommend.call_args.args[0],context)
+        self.assertEqual(self.bob.get('/api/advice/meal',query_string=when).json['context']['meal_count'],1)
+        self.assertEqual(self.alice.get('/api/advice/meal',query_string=when|{'time':'25:00'}).status_code,400)
+        self.assertEqual(self.alice.get('/api/advice/meal',query_string={'day':'2000-01-01','time':'10:00'}).status_code,400)
+
+    def test_advice_end_to_end_uses_sanitized_context_and_provider_errors(self):
+        import ai
+        from urllib.error import HTTPError
+        self.alice.put('/api/settings',json={'provider':'deepseek','api_key':'private-test-key'})
+        profile={'age':'30','sex':'female','height':'165','weight':'60','activity':'moderate',
+                 'goal':'muscle_gain','goal_detail':'','special_circumstances':'no'}
+        plan={'status':'ok','calories':2000,'carbs_percent':50,'protein_percent':20,'fat_percent':30,
+              'explanation':'根据活动水平估算','tips':['规律进餐']}
+        idea={'name':'鸡肉饭','portion':'一份鸡肉饭','calories':550,'carbs':60,'protein':35,'fat':19,'reason':'均衡搭配'}
+        def fake_provider(req,provider):
+            payload=json.loads(req.data);context=json.loads(payload['messages'][1]['content'])
+            self.assertEqual(provider,'deepseek');self.assertNotIn('private-test-key',req.data.decode())
+            self.assertNotIn('special_circumstances',context)
+            self.assertNotIn('不发送的食物',req.data.decode())
+            content={'ideas':[idea],'note':'按需要调整'} if 'day' in context else plan
+            return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(content,ensure_ascii=False)}}]}
+        with patch.object(ai,'provider_response',side_effect=fake_provider):
+            result=self.alice.post('/api/advice/nutrition',json=profile)
+            self.assertEqual(result.status_code,200)
+            recommendation=result.json['recommendation']
+            self.assertEqual((recommendation['calories'],recommendation['fat_goal']),(2000,66.7))
+            self.assertEqual(self.alice.get('/api/me').json['user']['target'],1800)
+            self.alice.put('/api/settings',json={'target':2000,'carbs_goal':recommendation['carbs_goal'],
+                'protein_goal':recommendation['protein_goal'],'fat_goal':recommendation['fat_goal'],'nutrition_goal':'muscle_gain'})
+            day=time.strftime('%Y-%m-%d',time.gmtime())
+            self.alice.post('/api/meals',json={'day':day,'category':'lunch','name':'不发送的食物','calories':400})
+            meal=self.alice.post('/api/advice/meal',json={'day':day,'time':'18:30'})
+            self.assertEqual(meal.status_code,200);self.assertEqual(meal.json['recommendation']['ideas'][0]['name'],'鸡肉饭')
+            self.assertEqual(meal.json['context']['remaining']['calories'],1600)
+        error=HTTPError('https://api.deepseek.com/chat/completions',429,'quota',{},io.BytesIO(b''))
+        with patch.object(ai,'provider_response',side_effect=error):
+            failed=self.alice.post('/api/advice/nutrition',json=profile)
+        self.assertEqual(failed.status_code,400);self.assertIn('额度',failed.json['error'])
+
     def test_frequent_food_is_private_persistent_and_uses_small_sticker(self):
         image=Image.new('RGBA',(640,480),(44,33,22,0));image.paste((230,60,10,255),(100,100,500,380))
         stream=io.BytesIO();image.save(stream,'PNG')

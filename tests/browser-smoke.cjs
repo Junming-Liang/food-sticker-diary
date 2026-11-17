@@ -26,6 +26,62 @@ const password = `test-${randomBytes(16).toString('hex')}`;
     await owner.goto(base);
     await signup(owner,0);
     assert.equal(await owner.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    // Both advice flows require explicit setup and confirmation, without a real provider call.
+    await owner.setViewportSize({width:320,height:700});
+    await owner.getByRole('button',{name:/这一餐吃什么/}).click();
+    await owner.getByRole('heading',{name:'先设置 AI 服务'}).waitFor();
+    await owner.getByRole('button',{name:'前往设置 AI 服务'}).click();
+    await owner.locator('#settings-form [name=provider]').selectOption('deepseek');
+    await owner.locator('#settings-form [name=api_key]').fill('deepseek-test-key');
+    await owner.getByRole('button',{name:'保存设置'}).click();
+    await owner.getByText('还没有设置完整的三大营养目标').waitFor();
+    await owner.getByRole('button',{name:'AI 生成目标'}).click();
+    const adviceForm=owner.locator('#nutrition-advice-form');
+    await adviceForm.locator('[name=age]').fill('30');
+    await adviceForm.locator('[name=sex]').selectOption('female');
+    await adviceForm.locator('[name=height]').fill('165');
+    await adviceForm.locator('[name=weight]').fill('60');
+    await adviceForm.locator('[name=activity]').selectOption('moderate');
+    await adviceForm.locator('[name=goal]').selectOption('other');
+    await adviceForm.locator('[name=goal_detail]').fill('改善饮食规律');
+    await adviceForm.locator('[name=special_circumstances]').selectOption('no');
+    assert.equal(await owner.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.querySelector('.sheet-inner').scrollWidth<=document.querySelector('.sheet-inner').clientWidth),true);
+    if(process.env.FOOD_ADVICE_SCREENSHOTS)await owner.screenshot({path:'/tmp/food-advice-form-320.png'});
+    let nutritionCalls=0;
+    await owner.route('**/api/advice/nutrition',async route=>{
+      nutritionCalls++;const body=route.request().postDataJSON();assert.equal(body.goal_detail,'改善饮食规律');
+      await route.fulfill({json:{recommendation:{status:'ok',calories:2100,split:{carbs:50,protein:20,fat:30},
+        carbs_goal:262.5,protein_goal:105,fat_goal:70,explanation:'结合活动量温和调整',tips:['规律进餐']}}});
+    });
+    await adviceForm.getByRole('button',{name:'同意并生成建议'}).click();
+    await owner.getByRole('heading',{name:'你的每日建议'}).waitFor();
+    assert.equal((await owner.evaluate(async()=>(await (await fetch('api/me')).json()).user.target)),1800);
+    if(process.env.FOOD_ADVICE_SCREENSHOTS)await owner.screenshot({path:'/tmp/food-advice-result-320.png'});
+    await owner.getByRole('button',{name:'修改信息'}).click();
+    assert.equal(await owner.locator('#nutrition-advice-form [name=goal_detail]').inputValue(),'改善饮食规律');
+    await owner.getByRole('button',{name:'同意并生成建议'}).click();
+    await owner.getByRole('button',{name:'确认并应用'}).click();
+    await owner.getByText('每日热量目标 2100 千卡').waitFor();
+    assert.equal(nutritionCalls,2);
+    const snapshot=await owner.evaluate(async()=>{const d=new Date(),pad=n=>String(n).padStart(2,'0');const day=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`,time=`${pad(d.getHours())}:${pad(d.getMinutes())}`;return (await (await fetch(`api/advice/meal?day=${day}&time=${time}`)).json()).context});
+    let mealCalls=0;
+    await owner.route('**/api/advice/meal',async route=>{
+      mealCalls++;const body=route.request().postDataJSON();assert.match(body.time,/^\d\d:\d\d$/);
+      await route.fulfill({json:{context:snapshot,recommendation:{ideas:[{name:'鸡肉米饭餐',portion:'鸡肉 100 克、米饭一碗',calories:550,carbs:60,protein:35,fat:19,reason:'搭配蔬菜更加均衡'}],note:'按饥饿程度调整'}}});
+    });
+    await owner.getByRole('button',{name:'同意并生成餐食建议'}).click();
+    await owner.getByRole('heading',{name:'鸡肉米饭餐'}).waitFor();
+    assert.equal(mealCalls,1);assert.equal(await owner.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    if(process.env.FOOD_ADVICE_SCREENSHOTS)await owner.screenshot({path:'/tmp/food-advice-meal-320.png'});
+    await owner.getByRole('button',{name:'关闭'}).click();
+    await owner.unroute('**/api/advice/nutrition');await owner.unroute('**/api/advice/meal');
+    await owner.evaluate(async()=>{const response=await fetch('api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:1800,carbs_goal:'',protein_goal:'',fat_goal:'',nutrition_goal:null})});if(!response.ok)throw Error('reset failed')});
+    await owner.setViewportSize({width:390,height:844});await owner.reload();
+    await owner.route('**/api/advice/meal?*',async route=>{await new Promise(resolve=>setTimeout(resolve,300));await route.continue().catch(()=>{})});
+    await owner.getByRole('button',{name:/这一餐吃什么/}).click();
+    await owner.getByRole('button',{name:'关闭'}).click();await owner.waitForTimeout(450);
+    assert.equal(await owner.locator('#sheet').evaluate(el=>el.open),false);
+    await owner.unroute('**/api/advice/meal?*');
     // Delayed responses from earlier tabs must not replace the newest view.
     await owner.route('**/api/**',async route => {
       await new Promise(resolve => setTimeout(resolve,250));

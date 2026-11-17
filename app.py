@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -151,7 +152,8 @@ def initialize():
             id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password TEXT NOT NULL, target INTEGER NOT NULL DEFAULT 1800,
             provider TEXT NOT NULL DEFAULT 'local', model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
-            created INTEGER NOT NULL, carbs_goal REAL, protein_goal REAL, fat_goal REAL, meal_split TEXT
+            created INTEGER NOT NULL, carbs_goal REAL, protein_goal REAL, fat_goal REAL, meal_split TEXT,
+            nutrition_goal TEXT, nutrition_goal_detail TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -243,6 +245,10 @@ def initialize():
                 db().execute(f'ALTER TABLE users ADD COLUMN {name} REAL')
         if 'meal_split' not in user_columns:
             db().execute('ALTER TABLE users ADD COLUMN meal_split TEXT')
+        if 'nutrition_goal' not in user_columns:
+            db().execute('ALTER TABLE users ADD COLUMN nutrition_goal TEXT')
+        if 'nutrition_goal_detail' not in user_columns:
+            db().execute("ALTER TABLE users ADD COLUMN nutrition_goal_detail TEXT NOT NULL DEFAULT ''")
         db().execute('''INSERT OR IGNORE INTO provider_settings(user_id,provider,model,api_key)
                      SELECT id,provider,model,api_key FROM users WHERE provider IN ('openai','deepseek')''')
         db().commit()
@@ -308,6 +314,7 @@ def public_user(user):
             'provider':user['provider'], 'model':user['model'], 'has_key':bool(user['api_key']),
             'provider_options':options,
             'carbs_goal':user['carbs_goal'], 'protein_goal':user['protein_goal'], 'fat_goal':user['fat_goal'],
+            'nutrition_goal':user['nutrition_goal'], 'nutrition_goal_detail':user['nutrition_goal_detail'],
             'meal_split':json.loads(user['meal_split']) if user['meal_split'] else None}
 
 
@@ -479,6 +486,15 @@ def settings():
         except (TypeError,ValueError): return jsonify(error='请输入有效的营养目标'),400
         if not 0.1 <= value <= 2000: return jsonify(error='营养目标需在 0.1 至 2000 克之间'),400
         goals.append(round(value,1))
+    nutrition_goal=data.get('nutrition_goal',current['nutrition_goal']) or None
+    if nutrition_goal not in (None,'fat_loss','muscle_gain','weight_gain','maintain','other'):
+        return jsonify(error='请选择有效的饮食目标'),400
+    detail=data.get('nutrition_goal_detail',current['nutrition_goal_detail'])
+    if not isinstance(detail,str) or len(detail.strip())>80 or any(ord(c)<32 for c in detail):
+        return jsonify(error='其他目标请填写 80 字以内的文字'),400
+    detail=detail.strip() if nutrition_goal=='other' else ''
+    if nutrition_goal=='other' and not detail:
+        return jsonify(error='请填写你的其他目标'),400
     meal_split=current['meal_split']
     if 'meal_split' in data:
         split=data['meal_split']
@@ -503,8 +519,8 @@ def settings():
                       ON CONFLICT(user_id,provider) DO UPDATE SET model=excluded.model,api_key=excluded.api_key''',
                      (g.user['id'],provider,model,saved_key))
     db().execute('''UPDATE users SET provider=?,model=?,api_key=?,target=?,
-                 carbs_goal=?,protein_goal=?,fat_goal=?,meal_split=? WHERE id=?''',
-                 (provider,model,saved_key,target,*goals,meal_split,g.user['id'])); db().commit()
+                 carbs_goal=?,protein_goal=?,fat_goal=?,meal_split=?,nutrition_goal=?,nutrition_goal_detail=? WHERE id=?''',
+                 (provider,model,saved_key,target,*goals,meal_split,nutrition_goal,detail,g.user['id'])); db().commit()
     user = db().execute('SELECT * FROM users WHERE id=?', (g.user['id'],)).fetchone()
     return jsonify(user=public_user(user))
 
@@ -518,6 +534,131 @@ def check_settings():
         ai.check_openai_model(cipher.decrypt(g.user['api_key'].encode()).decode(),g.user['model'])
     except ValueError as exc: return jsonify(error=str(exc)),400
     return jsonify(message='连接成功，当前项目可以查看所选模型；实际识别还取决于额度和模型权限。')
+
+
+ADVICE_GOALS={'fat_loss':'减脂','muscle_gain':'增肌','weight_gain':'增重','maintain':'维持','other':'其他'}
+ADVICE_ACTIVITIES={'sedentary':'久坐，基本不运动','light':'轻度活动，每周运动 1–2 天',
+                   'moderate':'中度活动，每周运动 3–5 天','active':'高活动，每周运动 6–7 天',
+                   'very_active':'体力劳动或高强度训练'}
+_advice_lock=threading.BoundedSemaphore(1)  # minimal: bound concurrent provider waits on the shared server.
+
+
+def nutrition_profile(data):
+    try:
+        age=int(str(data.get('age','')))
+        height=float(data.get('height',''))
+        weight=float(data.get('weight',''))
+    except (ValueError,TypeError,OverflowError):
+        raise ValueError('请填写有效的年龄、身高和体重')
+    if age<18: raise ValueError('未成年人需要个体化营养指导，请咨询医生或注册营养师')
+    if not (18<=age<=110 and math.isfinite(height) and 100<=height<=240 and
+            math.isfinite(weight) and 25<=weight<=300):
+        raise ValueError('请检查年龄、身高和体重是否填写正确')
+    if data.get('special_circumstances')!='no':
+        raise ValueError('孕期、哺乳期或有特殊健康需要时，请咨询医生或注册营养师制定目标')
+    sex=data.get('sex');activity=data.get('activity');goal=data.get('goal')
+    if (sex not in ('male','female','unspecified') or not isinstance(activity,str) or activity not in ADVICE_ACTIVITIES or
+            not isinstance(goal,str) or goal not in ADVICE_GOALS):
+        raise ValueError('请选择性别、活动水平和饮食目标')
+    detail=data.get('goal_detail','')
+    if not isinstance(detail,str) or len(detail.strip())>80 or any(ord(c)<32 for c in detail):
+        raise ValueError('其他目标请填写 80 字以内的文字')
+    detail=detail.strip() if goal=='other' else ''
+    if goal=='other' and not detail: raise ValueError('请填写你的其他目标')
+    if goal=='fat_loss' and weight/((height/100)**2)<18.5:
+        raise ValueError('当前身体数据不适合自动生成减脂目标，请咨询医生或注册营养师')
+    # Conservative screening only; a formula does not establish an individual's safe intake.
+    resting=10*weight+6.25*height-5*age+(5 if sex=='male' else -161)
+    return {'age':age,'height_cm':round(height,1),'weight_kg':round(weight,1),
+            'sex':{'male':'男','female':'女','unspecified':'未提供'}[sex],
+            'activity':ADVICE_ACTIVITIES[activity],'goal':ADVICE_GOALS[goal],
+            'goal_detail':detail,'screening_minimum':max(1200,math.ceil(resting))}
+
+
+def advice_provider():
+    provider=g.user['provider']
+    if provider not in ('openai','deepseek') or not g.user['api_key']:
+        raise ValueError('请先在「目标与识别设置」中配置 DeepSeek 或 OpenAI API')
+    return provider,cipher.decrypt(g.user['api_key'].encode()).decode(),g.user['model']
+
+
+@app.post('/api/advice/nutrition')
+@auth
+def recommend_nutrition():
+    try:
+        profile=nutrition_profile(body())
+        provider,key,model=advice_provider()
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    if not _advice_lock.acquire(blocking=False):
+        return jsonify(error='AI 建议正在生成，请稍后重试'),429
+    try:
+        return jsonify(recommendation=ai.nutrition_advice(profile,provider,key,model))
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    except Exception as exc:
+        app.logger.warning('Nutrition advice failed: %s',type(exc).__name__)
+        return jsonify(error='AI 建议暂时无法生成，请检查服务配置后重试'),502
+    finally:
+        _advice_lock.release()
+
+
+def meal_advice_context(day, local_time):
+    if (not valid_day(day) or abs((date.fromisoformat(day)-datetime.now(timezone.utc).date()).days)>1 or
+            not isinstance(local_time,str) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]',local_time)):
+        raise ValueError('请检查设备的日期和时间')
+    row=db().execute('''SELECT COUNT(*) AS count,COALESCE(SUM(calories),0) AS calories,
+        COALESCE(SUM(carbs),0) AS carbs,COALESCE(SUM(protein),0) AS protein,COALESCE(SUM(fat),0) AS fat
+        FROM meals WHERE user_id=? AND day=?''',(g.user['id'],day)).fetchone()
+    burned=db().execute('SELECT COALESCE(SUM(calories),0) FROM exercises WHERE user_id=? AND day=?',
+                        (g.user['id'],day)).fetchone()[0]
+    category_rows=db().execute('''SELECT category,COUNT(*) AS count,COALESCE(SUM(calories),0) AS calories
+        FROM meals WHERE user_id=? AND day=? GROUP BY category''',(g.user['id'],day)).fetchall()
+    counts={item['category']:item['count'] for item in category_rows}
+    category_calories={item['category']:round(item['calories'],1) for item in category_rows}
+    hour=int(local_time[:2])
+    category='breakfast' if 5<=hour<10 else 'lunch' if 10<=hour<14 else 'dinner' if 17<=hour<21 else 'snack'
+    meal={'breakfast':'早餐','lunch':'午餐','dinner':'晚餐','snack':'加餐'}[category]
+    split=json.loads(g.user['meal_split']) if g.user['meal_split'] else None
+    category_target=None
+    if split:
+        categories=('breakfast','lunch','dinner','snack')
+        exact={name:g.user['target']*split[name]/100 for name in categories}
+        portions={name:math.floor(exact[name]) for name in categories}
+        remainder=g.user['target']-sum(portions.values())
+        for name in sorted(categories,key=lambda name:-(exact[name]-portions[name]))[:remainder]: portions[name]+=1
+        category_target=portions[category]
+    targets={'calories':g.user['target']+burned,
+             **{name:g.user[name+'_goal'] for name in ('carbs','protein','fat')}}
+    consumed={name:round(row[name],1) for name in ('calories','carbs','protein','fat')}
+    remaining={name:round(targets[name]-consumed[name],1) if targets[name] is not None else None for name in targets}
+    goal=g.user['nutrition_goal']
+    return {'day':day,'time':local_time,'meal':meal,'meal_count':row['count'],'category_counts':counts,
+            'category_calories':category_calories,'meal_category_target':category_target,
+            'meal_category_consumed':category_calories.get(category,0),
+            'plan_goal':ADVICE_GOALS.get(goal,''),'goal_detail':g.user['nutrition_goal_detail'] if goal=='other' else '',
+            'daily_calorie_target':g.user['target'],'exercise_calories':round(burned,1),
+            'targets':targets,'consumed':consumed,'remaining':remaining,
+            'missing_goals':[name for name in ('carbs','protein','fat') if targets[name] is None]}
+
+
+@app.route('/api/advice/meal',methods=['GET','POST'])
+@auth
+def recommend_meal():
+    data=request.args if request.method=='GET' else body()
+    try: context=meal_advice_context(data.get('day',''),data.get('time',''))
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    if request.method=='GET': return jsonify(context=context)
+    if context['missing_goals']:
+        return jsonify(error='请先设置碳水、蛋白质和脂肪的每日目标'),400
+    try: provider,key,model=advice_provider()
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    if not _advice_lock.acquire(blocking=False):
+        return jsonify(error='AI 建议正在生成，请稍后重试'),429
+    try: return jsonify(context=context,recommendation=ai.meal_advice(context,provider,key,model))
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    except Exception as exc:
+        app.logger.warning('Meal advice failed: %s',type(exc).__name__)
+        return jsonify(error='餐食建议暂时无法生成，请检查服务配置后重试'),502
+    finally: _advice_lock.release()
 
 
 def clean_image(file):

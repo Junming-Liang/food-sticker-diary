@@ -131,3 +131,14 @@
 .frequent-delete{width:44px;min-height:48px;flex:none;display:grid;place-items:center;background:transparent;color:#9c5242}.frequent-delete .icon{width:17px;height:17px}
 .frequent-restore{min-height:44px;margin-top:12px}
 .frequent-back{margin-top:12px}
+
+.advice-entry{display:flex;align-items:center;gap:10px;width:100%;margin:-12px 0 24px;padding:13px 14px;border-radius:12px;background:#fff0eb;color:var(--ink);text-align:left}
+.advice-entry>.icon:first-child{color:#b9341d;width:20px;height:20px}.advice-entry>.icon:last-child{margin-left:auto;width:16px;height:16px;color:#955043}
+.advice-entry>span{flex:1;min-width:0}.advice-entry strong,.advice-entry small{display:block}.advice-entry strong{font-size:14px;line-height:20px}.advice-entry small{margin-top:2px;color:#704d45;font-size:12px;line-height:18px}
+.field[hidden]{display:none}.form-grid>.field{min-width:0}.advice-privacy{margin:16px 0;color:#5f5f59;font-size:12px;line-height:20px;overflow-wrap:anywhere}.advice-status{margin:0 0 10px;color:#686862;font-size:12px;line-height:20px}.advice-status:empty{display:none}
+.advice-result{padding:16px;background:#fff0eb;border-radius:14px}.advice-result>span{display:block;color:#704d45;font-size:12px}.advice-result>strong{display:block;margin:4px 0 14px;font-size:28px;line-height:36px;font-variant-numeric:tabular-nums}.advice-result small{font-size:12px;font-weight:400}
+.advice-macros{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.advice-macros>div{min-width:0}.advice-macros span,.advice-macros strong{display:block}.advice-macros span{color:#704d45;font-size:12px}.advice-macros strong{margin-top:4px;font-size:15px}
+.advice-explanation{margin:20px 0 0;color:#484842;font-size:14px;line-height:22px;overflow-wrap:anywhere}.advice-explanation h3{margin:0 0 6px;color:var(--ink);font-size:14px}.advice-explanation p{margin:0}.advice-explanation ul{padding-left:20px;margin:8px 0 0}
+.advice-context{margin:0 0 16px;padding:14px;border-radius:14px;background:#efefeb}.advice-context-head strong,.advice-context-head span{display:block}.advice-context-head strong{font-size:14px}.advice-context-head span,.advice-context p{margin:4px 0 0;color:#5f5f59;font-size:12px;line-height:20px}.advice-context p{overflow-wrap:anywhere}
+.advice-balance{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px;margin-top:14px}.advice-balance span,.advice-balance strong{display:block;font-size:12px;line-height:18px}.advice-balance span{color:#5f5f59}.advice-balance strong{margin-top:2px;overflow-wrap:anywhere}
+.meal-ideas{display:grid;gap:10px}.meal-idea{padding:14px;border-radius:12px;background:#fff}.meal-idea h3{margin:0;font-size:15px;line-height:22px;overflow-wrap:anywhere}.meal-idea p{margin:6px 0 0;color:#5f5f59;font-size:12px;line-height:20px;overflow-wrap:anywhere}.meal-idea-nutrition{margin-top:8px;color:#704d45;font-size:12px;line-height:20px;overflow-wrap:anywhere}
